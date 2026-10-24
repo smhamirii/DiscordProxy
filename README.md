@@ -1,5 +1,11 @@
 <p align="center"><img src="DiscordProxy.png" width="128" alt="Discord Proxy logo"></p>
 
+<p align="center">
+  <a href="https://github.com/smhamirii/Discord-Proxy/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Discord%20Proxy.exe-5865F2?style=for-the-badge&logo=windows" alt="Download">
+  </a>
+</p>
+
 # Discord Proxy
 
 **Route only Discord through your proxy. Everything else stays on your normal connection.**
