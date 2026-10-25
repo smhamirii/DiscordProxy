@@ -25,7 +25,7 @@ everything else                                   ──►  DIRECT (your ISP)
 
 ## Download
 
-Get **`Discord Proxy.exe`** from this repository (it sits right next to this README) and run it as Administrator.
+Get **`Discord Proxy.exe`** from releases section and run it as Administrator.
 
 Prefer to run from source? Install Python 3.10+ (with tcl/tk) and run:
 
