@@ -66,6 +66,7 @@ import collections
 import ctypes
 import hashlib
 import ipaddress
+import glob
 import json
 import math
 import os
@@ -111,7 +112,7 @@ VOICE_CHECK_WINDOW_S = 10  # after Discord joins a voice server, UDP media must 
 WIN_WIDTH = 470                # fixed window width; the height is measured from the content
 FAILOVER_FAILS = 5             # consecutive failed health probes before switching to the next saved link
 FAILOVER_MEMORY_S = 600        # a link that just failed is skipped for this long when picking the next one
-HISTORY_WINDOW_S = 3600        # connection history graph: last hour
+HISTORY_WINDOW_S = 3600        # connection history graph window
 SIDE_WIDTH = 520               # right-hand pane: server list, connection graph, live log
 TOTAL_WIDTH = WIN_WIDTH + SIDE_WIDTH
 HIST_H = 96
@@ -272,7 +273,7 @@ def wintun_dll_path() -> str:
 
 
 def config_dir() -> str:
-    return os.path.join(base_dir(), "config")
+    return os.path.join(base_dir(), "dp_data")
 
 
 def generated_config_path() -> str:
@@ -307,7 +308,7 @@ def sanitize_settings(data: dict) -> dict:
         if key in out and out[key] not in allowed:
             del out[key]
     for key in ("notifications", "auto_mode", "failover", "autostart", "autostart_delay", "show_log_panel",
-                "log_open", "history_open", "check_updates", "voice_probe"):
+                "log_open", "history_open", "check_updates", "voice_probe", "kill_switch"):
         if key in out and not isinstance(out[key], bool):
             out[key] = bool(out[key])
     if "autostart_delay_s" in out:
@@ -1563,6 +1564,70 @@ def close_discord_processes():
     time.sleep(0.8)
     left = sum(1 for n in DISCORD_KILL_NAMES if n.lower() in running_process_names())
     return -1, left     # -1 = number closed is unknown (taskkill fallback)
+
+
+# ----------------------------------------------------------------------------
+# Kill switch: while the proxy is down, Windows Firewall blocks Discord's own
+# outbound traffic so it can never fall back to your direct connection.
+# ----------------------------------------------------------------------------
+
+KILLSWITCH_RULE = "DiscordProxy KillSwitch"
+_KS_LOCK = threading.Lock()
+
+
+def _discord_program_paths() -> list:
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    found = set()
+    for folder in ("Discord", "DiscordPTB", "DiscordCanary", "DiscordDevelopment"):
+        root = os.path.join(local, folder)
+        for pat in (os.path.join(root, "app-*", "*.exe"), os.path.join(root, "*.exe")):
+            for p in glob.glob(pat):
+                base = os.path.basename(p).lower()
+                if base.startswith("discord") or base == "update.exe":
+                    found.add(os.path.normpath(p))
+    return sorted(found)
+
+
+def _netsh_fw(args: list, timeout: int = 15):
+    return subprocess.run(["netsh", "advfirewall", "firewall"] + args, capture_output=True, text=True,
+                          timeout=timeout, creationflags=_NO_WINDOW)
+
+
+def killswitch_release() -> None:
+    """Removes every kill-switch firewall rule (Discord can reach the network again)."""
+    if os.name != "nt":
+        return
+    try:
+        _netsh_fw(["delete", "rule", f"name={KILLSWITCH_RULE}"])
+    except Exception:
+        pass
+
+
+def killswitch_engage() -> int:
+    """Adds an outbound BLOCK rule for every Discord program. Returns how many rules were added."""
+    if os.name != "nt":
+        return 0
+    killswitch_release()                       # never stack duplicates
+    added = 0
+    for path in _discord_program_paths():
+        try:
+            r = _netsh_fw(["add", "rule", f"name={KILLSWITCH_RULE}", "dir=out", "action=block",
+                           f"program={path}", "enable=yes", "profile=any"])
+            if r.returncode == 0:
+                added += 1
+        except Exception:
+            pass
+    return added
+
+
+def killswitch_rules_exist() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        r = _netsh_fw(["show", "rule", f"name={KILLSWITCH_RULE}"])
+        return r.returncode == 0 and KILLSWITCH_RULE.lower() in (r.stdout or "").lower()
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -4068,6 +4133,9 @@ class DiscordProxyApp(tk.Tk):
         self._learning_note_shown = False
         self._capture_active = "all"       # capture mode the current run really uses
         self._force_all = False            # voice fallback: capture everything for this run
+        self._learning_run = False         # this run is a range-learning / capture-everything fallback pass
+        self._ks_engaged = False           # kill switch: Discord is currently firewalled off
+        self._ks_gen = 0
         self._voice_deadline: float | None = None
         self._voice_return_gen = 0         # cancels stale 'return to Discord-only' timers
         self._early_return_pending = False  # a quick 'back to Discord-only' is scheduled
@@ -4122,6 +4190,7 @@ class DiscordProxyApp(tk.Tk):
         self.after(60000, self._history_tick)
         self.after(1500, self._startup_download_prompt)
         self.after(2500, self._autostart_refresh)
+        self.after(1200, self._ks_startup_check)
         self.after(8000, self._update_tick)
         if start_hidden:
             self._hint_shown = True
@@ -4316,7 +4385,7 @@ class DiscordProxyApp(tk.Tk):
                         ).pack(anchor="w", pady=(2, 0))
 
         # ---- connection history
-        ttk.Label(side, text="Voice ping (last hour)", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
+        ttk.Label(side, text="Voice ping", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
         self.hist_canvas = tk.Canvas(side, height=HIST_H, highlightthickness=1, bd=0)
         self.hist_canvas.pack(fill="x")
         self.hist_canvas.bind("<Configure>", lambda e: self._redraw_history())
@@ -4640,7 +4709,7 @@ class DiscordProxyApp(tk.Tk):
                              "Windows account or PC) - paste it again ---")
         elif os.name == "nt" and not _LINK_STATE["encrypted"]:
             self._append_log("--- WARNING: could not encrypt the saved link (Windows DPAPI unavailable) - "
-                             "it is stored in plain text in config\\settings.json ---")
+                             "it is stored in plain text in dp_data\\settings.json ---")
 
     def _prepare_chain(self, text: str, interactive: bool) -> bool:
         """Parses the link, starts xray-core if needed and writes sing-box's
@@ -4877,6 +4946,7 @@ class DiscordProxyApp(tk.Tk):
         return True
 
     def _restart_chain(self, delay: float):
+        ks_thread = self._ks_engage("proxy chain restarting")   # armed runs only; before the TUN goes away
         self._recovering = True
         self._launch_token += 1
         token = self._launch_token
@@ -4886,6 +4956,8 @@ class DiscordProxyApp(tk.Tk):
 
         def worker():
             try:
+                if ks_thread is not None:
+                    ks_thread.join(timeout=10)         # Discord is firewalled before sing-box stops
                 self._manager.stop()
                 x, self._xray = self._xray, None
                 if x:
@@ -4905,6 +4977,7 @@ class DiscordProxyApp(tk.Tk):
         self._begin_launch()
 
     def _give_up(self, reason: str):
+        self._ks_engage("auto-recover gave up")
         self._want_running = False
         self._recovering = False
         if self._auto_started:
@@ -4913,7 +4986,8 @@ class DiscordProxyApp(tk.Tk):
         self._stop_everything()
         info = explain_failure(self._recent_lines())
         extra = _SHORT_FAIL.get(info[0], ("", ""))[1] if info else "See Export Log."
-        self.status_bar.configure(text=f"Status: stopped - {short_reason(reason)}")
+        self.status_bar.configure(text=f"Status: stopped - {short_reason(reason)}"
+                                       + (" - Discord blocked (kill switch)" if self._ks_engaged else ""))
         self._notify("Proxy stopped", f"{short_reason(reason)}. {extra}".strip(), "error")
 
     def _on_health(self, token: int, result):
@@ -4929,6 +5003,8 @@ class DiscordProxyApp(tk.Tk):
             self._health_fail = 0
             self._health_restarted = False
             self._guard_notified = False
+            if self._ks_engaged:
+                self._ks_release("proxy verified - Discord unblocked")
             if isinstance(result, dict):
                 if result.get("median") is not None:
                     self._ping_ms = int(result["median"])
@@ -5302,11 +5378,86 @@ class DiscordProxyApp(tk.Tk):
             self._append_log(f"--- Discord closed completely ({n} process(es)) ---")
             self.status_bar.configure(text="Status: Discord closed completely")
 
+    # ---- kill switch
+
+    def _ks_armed(self) -> bool:
+        """Active only for a normal run: not while ranges are still being learned / everything is
+        captured as a fallback, and only if the setting is on."""
+        return (os.name == "nt" and bool(self._settings.get("kill_switch", True))
+                and self._want_running and not self._learning_run)
+
+    def _ks_run(self, engage: bool):
+        self._ks_gen += 1
+        gen = self._ks_gen
+
+        def worker():
+            with _KS_LOCK:
+                if gen != self._ks_gen:         # a newer engage/release superseded this one
+                    return
+                if engage:
+                    n = killswitch_engage()
+                    msg = (f"--- kill switch: Discord is blocked ({n} firewall rule(s)) ---" if n
+                           else "--- kill switch: no Discord program found to block (needs Administrator) ---")
+                else:
+                    killswitch_release()
+                    msg = "--- kill switch: Discord unblocked ---"
+            self._event_queue.put(("log", msg))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return t
+
+    def _ks_engage(self, reason: str):
+        """Blocks Discord until the proxy is verified again. Returns the worker thread (or None)."""
+        if self._ks_engaged or not self._ks_armed():
+            return None
+        self._ks_engaged = True
+        self._append_log(f"--- kill switch: {reason} - blocking Discord until the proxy answers again ---")
+        self._notify("Kill switch active", "Proxy down - Discord is blocked so it cannot connect directly.",
+                     "warning")
+        return self._ks_run(True)
+
+    def _ks_release(self, why: str = "", force: bool = False):
+        if not self._ks_engaged and not force:
+            return
+        self._ks_engaged = False
+        if why:
+            self._append_log(f"--- kill switch: {why} ---")
+        self._ks_run(False)
+
+    def _ks_release_now(self):
+        """Synchronous release (used on exit so Discord is never left blocked)."""
+        self._ks_engaged = False
+        self._ks_gen += 1
+        with _KS_LOCK:
+            killswitch_release()
+
+    def _ks_startup_check(self):
+        """Rules left by a previous run (crash while the proxy was down): keep them only while the
+        kill switch is on - they are lifted as soon as the proxy is verified."""
+        if os.name != "nt" or not is_admin():
+            return
+
+        def worker():
+            if not killswitch_rules_exist():
+                return
+            if self._settings.get("kill_switch", True):
+                self._ks_engaged = True
+                self._event_queue.put(("log", "--- kill switch: still active from the previous run - Discord is "
+                                              "unblocked once the proxy answers (Start), or from Settings > Network ---"))
+            else:
+                with _KS_LOCK:
+                    killswitch_release()
+                self._event_queue.put(("log", "--- kill switch: removed leftover rules (kill switch is off) ---"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def stop_proxy(self):
         self._want_running = False
         self._recovering = False
         self._health_lost = False
         self._auto_suppressed = True  # a manual Stop must not be undone by auto mode while Discord is open
+        self._ks_release("proxy stopped by you")
         self._stop_everything()
         self.status_bar.configure(text="Status: stopped")
         self._append_log("--- stop requested ---")
@@ -5525,6 +5676,7 @@ class DiscordProxyApp(tk.Tk):
             self.status_bar.configure(text="Status: stopped")
             return
 
+        self._ks_engage("sing-box stopped")
         if time.monotonic() - self._launch_time < 20:
             # It never got going: explain why instead of restarting in a loop.
             self._want_running = False
@@ -5719,6 +5871,7 @@ class DiscordProxyApp(tk.Tk):
     def _capture_settings(self) -> dict:
         """What the TUN should capture + whether strict_route is on, from Settings."""
         mode = self._settings.get("capture_mode", "discord")
+        configured_mode = mode
         pref = self._settings.get("strict_route", "auto")
         capture: dict = {}
         if mode == "discord" and self._force_all:
@@ -5737,6 +5890,9 @@ class DiscordProxyApp(tk.Tk):
             else:
                 capture.update(routes)
         self._capture_active = mode
+        # Learning pass = "Discord only" is configured but this run had to capture everything
+        # (ranges unknown / voice fallback). The kill switch arms only once that pass is over.
+        self._learning_run = (configured_mode == "discord" and mode == "all")
         strict = (mode == "all") if pref == "auto" else (pref == "on")
         capture["strict_route"] = strict
         capture["stack"] = self._settings.get("tun_stack", "mixed")
@@ -5840,6 +5996,7 @@ class DiscordProxyApp(tk.Tk):
             return
         self._exiting = True
         self._want_running = False
+        self._ks_release_now()
         self._testall_cancel.set()
         self._dl_cancel.set()
         kill_test_processes()
@@ -6085,6 +6242,8 @@ class DiscordProxyApp(tk.Tk):
         self._learned.clear()
         self._learning_note_shown = False
         self._force_all = False
+        self._learning_run = False
+        self._ks_release(force=True)
         self._voice_deadline = None
         self._voice_return_gen += 1
         self._capture_active = "all"
@@ -6476,8 +6635,17 @@ class DiscordProxyApp(tk.Tk):
                 proto, addr = self._link_meta(item["link"])
                 tree.insert("", "end", iid=str(i), tags=tags,
                             values=(rank.get(item["link"], ""), mark + item["name"], proto, addr, lat, status))
-            if sel and sel[0] in tree.get_children():
-                tree.selection_set(sel[0])
+            kids = tree.get_children()
+            target = next((str(i) for i, l in enumerate(links) if l["link"] == cur), None)
+            if self._want_running and sel and sel[0] in kids:
+                target = sel[0]                         # running: leave the user's own highlight alone
+            elif target is None and sel and sel[0] in kids:
+                target = sel[0]
+            elif target is None and not cur and kids:
+                target = kids[0]                        # nothing remembered yet: never leave the list unselected
+            if target is not None and target in kids:
+                tree.selection_set(target)
+                tree.see(target)
         except tk.TclError:
             pass
 
@@ -7122,6 +7290,23 @@ class DiscordProxyApp(tk.Tk):
             ttk.Radiobutton(mrow, text=text, value=val, variable=mtu_var,
                             command=lambda: (self._set_setting("tun_mtu", mtu_var.get()),
                                              self._capture_changed())).pack(side="left", padx=(0, 10))
+
+        heading(t, "Kill switch")
+        ks_var = tk.BooleanVar(value=bool(self._settings.get("kill_switch", True)))
+
+        def on_ks():
+            self._set_setting("kill_switch", ks_var.get())
+            if not ks_var.get():
+                self._ks_release("turned off in Settings", force=True)
+
+        ttk.Checkbutton(t, text="Block Discord completely if the proxy fails", variable=ks_var,
+                        command=on_ks).pack(anchor="w")
+        ttk.Button(t, text="Unblock Discord now",
+                   command=lambda: self._ks_release("unblocked by you", force=True)).pack(anchor="w", pady=(6, 0))
+        note(t, "Active only after Discord's voice range is learned (or when 'Everything' is chosen) - never during "
+                "the learning run. If the proxy dies or is being restarted, a Windows Firewall rule stops Discord from "
+                "connecting directly; it is lifted as soon as the proxy answers again, when you press Stop, or on exit. "
+                "Needs Administrator.")
 
         heading(t, "Servers (right-hand list)")
         fo_var = tk.BooleanVar(value=bool(self._settings.get("failover", True)))
