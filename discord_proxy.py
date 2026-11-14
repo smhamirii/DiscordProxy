@@ -75,6 +75,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -98,6 +99,11 @@ from xml.sax.saxutils import escape as xml_escape
 
 OUTBOUND_TAG = "user-proxy"
 DISCORD_PROCESS_NAMES = ["Discord.exe", "DiscordPTB.exe", "DiscordCanary.exe"]
+# While one of these is running (you are in a match) the "game guard" keeps the tunnel out of its way:
+# Discord-only capture (never "capture everything"), no automatic tunnel restarts, the proxy processes
+# run at above-normal priority, DNS scoped to Discord names, and the game's servers are checked to stay
+# out of the tunnel. Check the exact .exe name in Task Manager (Details tab); add yours if it differs.
+GAME_PROCESS_NAMES = ["bf6.exe", "bf6event.exe", "battlefield6.exe", "battlefield 6.exe"]
 # Resolved per Windows user: %LOCALAPPDATA% -> C:\Users\<current user>\AppData\Local
 DISCORD_DEFAULT_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
@@ -108,6 +114,11 @@ HEALTH_FAILS_NOTICE = 3    # consecutive failed probes before the status shows "
 HEALTH_FAILS_RESTART = 12  # consecutive failed probes before the chain is restarted (~4 min). A weak link is
                            # NOT a dead proxy: restarting tears down the TUN adapter and every UDP flow, and
                            # a Discord voice call that lost its flow stays at ~5000 ms until rejoined.
+# When the voice fallback has to capture everything (new voice server outside the known ranges),
+# games would run through the tunnel for the whole call. With this on, the program goes back to
+# "Discord destinations only" a few seconds after the new range is learned (the call reconnects
+# once, one time per new range) instead of waiting for the call to end.
+EARLY_RETURN_AFTER_LEARN = True
 VOICE_CHECK_WINDOW_S = 10  # after Discord joins a voice server, UDP media must be in the tunnel by then
 WIN_WIDTH = 470                # fixed window width; the height is measured from the content
 FAILOVER_FAILS = 5             # consecutive failed health probes before switching to the next saved link
@@ -1170,7 +1181,7 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
                 "address": ["172.19.0.1/30"],
                 "mtu": 1500,
                 "auto_route": True,
-                "strict_route": True,
+                "strict_route": False,
                 "stack": "mixed",
             }
         ],
@@ -1215,6 +1226,10 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
                  "action": "hijack-dns"},
                 {"protocol": "dns", "process_path_regex": [r"(?i).*dnsrslvr\.dll.*"],
                  "action": "hijack-dns"},
+                # Windows lists the TUN adapter's own address (172.19.0.2) as a DNS server. A
+                # program that picks it must get a real answer (from the main connection's
+                # DNS), not a dead end - otherwise it "cannot connect".
+                {"protocol": "dns", "ip_cidr": ["172.19.0.0/30"], "action": "hijack-dns"},
                 # Discord's Chromium tries HTTP/3 (QUIC, UDP 443) first for hostnames such as the
                 # attachment-upload host. Many proxy servers carry UDP badly, so an upload filled
                 # the progress bar and then silently failed. Rejecting QUIC to Discord's domains
@@ -1235,11 +1250,20 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
             ],
         },
     }
+    # Everything that is NOT Discord must resolve through the DNS servers of the user's MAIN
+    # connection - exactly what Windows used before the tunnel existed. sing-box's "local"
+    # resolver asks Windows again, and Windows prefers the TUN adapter's own DNS, so answers
+    # could differ from the user's DNS (other game server / CDN -> higher, unstable ping).
+    main_dns = [d for d in ((capture or {}).get("main_dns") or []) if d]
+    if main_dns:
+        cfg["dns"]["servers"][0] = {"type": "udp", "tag": "direct-dns",
+                                    "server": main_dns[0], "server_port": 53}
     if capture:
         tun = cfg["inbounds"][0]
         # strict_route is the most invasive TUN option (it adds Windows firewall
-        # rules and blocks DNS around the tunnel); callers can turn it off.
-        tun["strict_route"] = bool(capture.get("strict_route", True))
+        # rules that block DNS on the real network adapter, so the user's own DNS stops
+        # working). It is OFF unless the user switches it on in Settings.
+        tun["strict_route"] = bool(capture.get("strict_route", False))
         # Switchable in Settings (defaults = what it always used): the TUN stack and
         # MTU can change how UDP voice packets are paced through the tunnel.
         if capture.get("stack") in ("mixed", "system", "gvisor"):
@@ -1253,6 +1277,23 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
             tun["route_address"] = list(capture["route_address"])
         if capture.get("route_exclude_address"):
             tun["route_exclude_address"] = list(capture["route_exclude_address"])
+    if capture and capture.get("route_address"):
+        # Process lookup can stall for seconds while a game hogs the CPU ("failed to search process");
+        # such a connection matched no process rule and left DIRECT (Discord voice broke, ping spike).
+        # Only Discord's own destinations are routed into the TUN in this mode, so route them to the
+        # proxy by destination as well, whatever the process lookup says.
+        real = [r for r in capture["route_address"] if r != FAKEIP_RANGE]
+        extra = [{"domain_suffix": DISCORD_DOMAIN_SUFFIXES, "outbound": "proxy"}]
+        if real:
+            # voice media only (UDP, Discord's media ports): another program that happens to talk to the
+            # same Cloudflare-sized range (TCP, or UDP on other ports) is never pushed to the proxy
+            extra.append({"network": "udp", "ip_cidr": real, "port_range": ["19000:19999", "50000:65535"],
+                          "outbound": "proxy"})
+        rules = cfg["route"]["rules"]
+        at = next((i for i, r in enumerate(rules)
+                   if r.get("process_name") == DISCORD_PROCESS_NAMES and r.get("outbound") == "proxy"),
+                  len(rules) - 2)
+        rules[at + 1:at + 1] = extra
     if api:
         # Local-only stats endpoint (127.0.0.1, random port + random secret),
         # polled by TrafficMonitor to show total upload/download.
@@ -1276,6 +1317,7 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
 # ============================================================================
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+_PS_FLAGS = _NO_WINDOW | (0x00008000 if os.name == "nt" else 0)   # PowerShell at ABOVE_NORMAL: a game at 100% CPU must not starve it
 
 
 # ============================================================================
@@ -1764,6 +1806,130 @@ def check_prerequisites():
     ]
 
 
+
+# ----------------------------------------------------------------------------
+# DNS scoping: only Discord's names may use the tunnel's resolver
+# ----------------------------------------------------------------------------
+# sing-box gives the TUN adapter its own DNS server (172.19.0.2) with the lowest metric, so
+# Windows asked it for EVERY name of EVERY program (the game's included). Those lookups then
+# took a different path/timing than your main connection's DNS (the gaming DNS), which can
+# change which server/relay the game picks (ping 90 -> 150, unstable). A Windows NRPT rule sends
+# only Discord's domains to the tunnel; the TUN adapter loses its general DNS entry, so every
+# other lookup goes straight to the main connection's DNS again, exactly as without the program.
+
+DNS_SCOPE_COMMENT = "DiscordProxy"
+_dns_scope_lock = threading.Lock()
+
+
+def dns_scope_remove() -> None:
+    """Removes the NRPT rule(s) this program added. Safe to call any time, any number of times."""
+    if os.name != "nt":
+        return
+    bypass_clear()
+    ps = ("Get-DnsClientNrptRule -ErrorAction SilentlyContinue | "
+          "Where-Object { $_.Comment -eq '" + DNS_SCOPE_COMMENT + "' } | "
+          "Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue")
+    with _dns_scope_lock:
+        try:
+            subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                            "-Command", ps], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30, creationflags=_PS_FLAGS)
+        except Exception:
+            pass
+
+
+def dns_scope_apply() -> str:
+    """Returns 'scoped' when only Discord's names use the tunnel's resolver now, else 'failed'.
+    On any failure nothing is changed, so Discord keeps working exactly as before."""
+    if os.name != "nt":
+        return "failed"
+    names = []
+    for d in DISCORD_DOMAIN_SUFFIXES:
+        names += [d, "." + d]
+    arr = ",".join("'" + n + "'" for n in names)
+    ps = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "try {\n"
+        "  $a = Get-NetAdapter -Name 'DiscordProxy' -ErrorAction Stop\n"
+        "  $dns = (Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4)"
+        ".ServerAddresses | Where-Object { $_ -like '172.19.0.*' } | Select-Object -First 1\n"
+        "  if (-not $dns) { $dns = '172.19.0.2' }\n"
+        "  Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '" + DNS_SCOPE_COMMENT + "' } | "
+        "Remove-DnsClientNrptRule -Force\n"
+        "  Add-DnsClientNrptRule -Namespace @(" + arr + ") -NameServers $dns -Comment '" + DNS_SCOPE_COMMENT + "'\n"
+        "  $ok = Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '" + DNS_SCOPE_COMMENT + "' }\n"
+        "  if (-not $ok) { throw 'rule missing' }\n"
+        "  try { Set-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -AutomaticMetric Disabled "
+        "-InterfaceMetric 5000 -ErrorAction Stop } catch {}\n"
+        "  Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses\n"
+        "  Clear-DnsClientCache\n"
+        "  'scoped'\n"
+        "} catch { 'failed' }\n"
+    )
+    out = ""
+    with _dns_scope_lock:
+        for attempt in (1, 2, 3):
+            try:
+                out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                                      "Bypass", "-Command", ps], capture_output=True, text=True,
+                                     timeout=60, creationflags=_PS_FLAGS).stdout
+            except Exception:
+                out = ""                  # PowerShell slow/starved by a game: retry below
+            if "scoped" in (out or ""):
+                break
+            if attempt < 3:
+                time.sleep(3)
+    return "scoped" if "scoped" in (out or "") else "failed"
+
+
+# ----------------------------------------------------------------------------
+# Game guard (Battlefield 6)
+# ----------------------------------------------------------------------------
+
+def game_running() -> str | None:
+    names = running_process_names()
+    for n in GAME_PROCESS_NAMES:
+        if n.lower() in names:
+            return n
+    return None
+
+
+def set_priority(pids, cls: int) -> None:
+    """Set the priority class of processes (0x8000 ABOVE_NORMAL, 0x20 NORMAL). Best effort, never raises."""
+    if os.name != "nt":
+        return
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        for pid in pids:
+            if not pid:
+                continue
+            h = k32.OpenProcess(0x0200 | 0x1000, False, int(pid))   # SET_INFORMATION | QUERY_LIMITED
+            if h:
+                try:
+                    k32.SetPriorityClass(h, cls)
+                finally:
+                    k32.CloseHandle(h)
+    except Exception:
+        pass
+
+
+def proxy_pids(app) -> list:
+    out = []
+    for attr in ("_manager", "_xray"):
+        m = getattr(app, attr, None)
+        pr = getattr(m, "_process", None) if m is not None else None
+        try:
+            if pr is not None and pr.poll() is None:
+                out.append(pr.pid)
+        except Exception:
+            pass
+    return out
+
+
 def flush_dns() -> None:
     """Drop cached fake IPs so Discord doesn't keep them after the proxy stops."""
     if os.name != "nt":
@@ -1875,10 +2041,17 @@ class SingBoxManager:
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
-                self.on_log(line.rstrip("\n"))
+                line = line.rstrip("\n")
+                self.on_log(line)
+                if "inbound/tun[tun-in]: started at" in line:
+                    threading.Thread(target=self._scope_dns, daemon=True).start()
         except Exception:
             pass
         finally:
+            # sing-box is gone: the Discord-only DNS rule must not outlive its resolver
+            # (skipped when a newer sing-box already took over, so a restart can't delete its rule)
+            if self._process is None or self._process is proc:
+                dns_scope_remove()
             # proc.stdout hitting EOF doesn't guarantee the process has been
             # reaped yet - poll() can still race and return None here, so
             # wait() (which blocks briefly until it truly exits) is used to
@@ -1889,8 +2062,24 @@ class SingBoxManager:
                 code = proc.poll()
             self.on_exit(code if code is not None else -1)
 
+    def _scope_dns(self) -> None:
+        for delay in (1.5, 20.0):       # right after the TUN is up, and once more in case it was reset
+            time.sleep(delay)
+            if not self.is_running:
+                return
+            res = dns_scope_apply()
+            if delay == 1.5:
+                self.on_log("--- DNS scope: only Discord names use the tunnel's resolver; everything else "
+                            "(your game) asks your main connection's DNS directly, as without this program ---"
+                            if res == "scoped" else
+                            "--- DNS scope: could not be applied (Discord keeps working); other programs' "
+                            "DNS still passes through the tunnel's resolver ---")
+            if res != "scoped":
+                return
+
     def stop(self) -> None:
         proc = self._process
+        dns_scope_remove()
 
         # Even if our Popen handle is already gone, clean up any stale TUN
         # adapter from a previous crashed/force-killed sing-box instance.
@@ -2243,8 +2432,35 @@ def read_ranges_file(path: str):
     return include, exclude
 
 
+# Only UDP ("packet connection") flows are learned: that is Discord's voice media. A TCP flow to a
+# literal IP is usually something else (e.g. a gaming-DNS relay that answers for many sites with
+# its own address) and must never turn that IP's whole /16 into a "Discord range".
 _LEARN_RE = re.compile(
-    r"outbound/[a-z0-9]+\[user-proxy\]: outbound (?:packet )?connection to (\d{1,3}(?:\.\d{1,3}){3}):\d+")
+    r"outbound/[a-z0-9]+\[user-proxy\]: outbound packet connection to (\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
+
+# DNS servers of the user's main connection (filled in by get_main_dns_servers). Their
+# neighbourhood is never learned or routed as a Discord range.
+_protected_ips: set = set()
+
+
+_PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4")]
+
+
+def _overlaps_private(cidr: str) -> bool:
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+        return any(net.overlaps(p) for p in _PRIVATE_NETS)
+    except ValueError:
+        return False
+
+
+def _hits_protected_ip(cidr: str) -> bool:
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+        return any(ipaddress.ip_address(ip) in net for ip in list(_protected_ips))
+    except ValueError:
+        return False
 
 
 def learn_range_from_log_line(line: str):
@@ -2252,7 +2468,7 @@ def learn_range_from_log_line(line: str):
     proxy) reaching a literal public IPv4 address - i.e. voice/UDP media -
     returns that address's /22 as a CIDR string, else None."""
     m = _LEARN_RE.search(line)
-    if not m or m.group(1) == PROBE_DEST[0]:
+    if not m or m.group(1) == PROBE_DEST[0] or m.group(2) in ("53", "853"):
         return None
     try:
         ip = ipaddress.ip_address(m.group(1))
@@ -2261,7 +2477,10 @@ def learn_range_from_log_line(line: str):
     if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
             or ip.is_unspecified or ip in ipaddress.ip_network(FAKEIP_RANGE)):
         return None
-    return str(ipaddress.ip_network(f"{ip}/{LEARN_PREFIX}", strict=False))
+    cidr = str(ipaddress.ip_network(f"{ip}/{LEARN_PREFIX}", strict=False))
+    if _hits_protected_ip(cidr):
+        return None
+    return cidr
 
 
 _VOICE_WS_RE = re.compile(
@@ -2338,21 +2557,99 @@ def get_system_dns_servers() -> list:
     return servers
 
 
+_main_dns_cache = (0.0, [])
+
+
+def get_main_dns_servers() -> list:
+    """IPv4 DNS servers of the MAIN connection (the adapter that owns the default route,
+    ignoring this program's own TUN adapter), primary first. [] if it cannot be told."""
+    global _main_dns_cache
+    if os.name != "nt":
+        return []
+    now = time.monotonic()
+    if _main_dns_cache[1] and now - _main_dns_cache[0] < 30:
+        return list(_main_dns_cache[1])
+    ps = ("$best = Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected "
+          "-ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -ne 'DiscordProxy' } | "
+          "ForEach-Object { $i = $_; Get-NetRoute -InterfaceIndex $i.InterfaceIndex "
+          "-DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
+          "ForEach-Object { [pscustomobject]@{ Idx = $i.InterfaceIndex; M = $i.InterfaceMetric + $_.RouteMetric } } } | "
+          "Sort-Object M | Select-Object -First 1; "
+          "if ($best) { (Get-DnsClientServerAddress -InterfaceIndex $best.Idx -AddressFamily IPv4 "
+          "-ErrorAction SilentlyContinue).ServerAddresses }")
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True, text=True, timeout=20, creationflags=_PS_FLAGS,
+        ).stdout
+    except Exception:
+        return list(_main_dns_cache[1])          # last known good beats nothing (PowerShell starved by a game)
+    servers = []
+    for line in out.splitlines():
+        line = line.strip()
+        try:
+            ip = ipaddress.ip_address(line)
+        except ValueError:
+            continue
+        if ip.version != 4 or ip.is_loopback or ip.is_unspecified or line.startswith("172.19.0."):
+            continue
+        if line not in servers:
+            servers.append(line)
+    if not servers:
+        return list(_main_dns_cache[1])
+    _main_dns_cache = (now, servers)
+    _protected_ips.update(servers)
+    return servers
+
+
+# Starting ranges, so the very first run never has to capture everything (which would push
+# games through the tunnel). Discord's own voice block and Cloudflare's block it also uses.
+# Best-effort guesses - more are learned from real voice calls, and discord_ranges.txt is yours.
+DEFAULT_DISCORD_RANGES = ["66.22.192.0/18", "162.159.128.0/17", "104.29.0.0/16"]   # 104.29/16: seen in your logs
+
+
 def compute_discord_capture(learned):
     """Returns (capture_dict, "") or (None, reason) when 'Discord only' mode
-    can't be used safely right now (the caller then captures everything)."""
+    can't be used safely right now (the caller then captures everything).
+
+    Only Discord's own destinations enter the tunnel. The user's DNS server is NOT routed into
+    it any more: Windows already sends Discord's lookups to the tunnel's own DNS address, and
+    routing the real DNS server's IP in would also drag a gaming-DNS relay's game traffic (and
+    every other program's DNS) through the tunnel."""
     manual_inc, manual_exc = read_ranges_file(manual_ranges_path())
-    include = sorted(set(learned) | set(manual_inc))
+    dns = get_main_dns_servers() or get_system_dns_servers()
+    _protected_ips.update(dns)
+    if game_running():                          # never route a running game's servers into the tunnel
+        try:
+            for ip, _port in game_peers(8):
+                _protected_ips.add(ip)
+        except Exception:
+            pass
+    dropped = []
+    auto = [c for c in (set(learned) | set(DEFAULT_DISCORD_RANGES)) if not _hits_protected_ip(c)]
+    include = []
+    for c in sorted(set(auto) | set(manual_inc)):
+        if _overlaps_private(c):
+            dropped.append(c)                   # a typo like 192.168.0.0/16 would hijack the whole LAN
+        elif c in manual_inc and _hits_protected_ip(c):
+            dropped.append(c)                   # manual range that contains your DNS relay / the game's servers
+        else:
+            include.append(c)
     if not include:
         return None, "no Discord destination ranges are known yet"
-    dns = get_system_dns_servers()
-    if not dns:
-        return None, "the system DNS servers could not be detected"
     routes = []
-    for r in [FAKEIP_RANGE] + [f"{d}/32" for d in dns] + include:
+    for r in [FAKEIP_RANGE] + include:
         if r not in routes:
             routes.append(r)
-    return {"route_address": routes, "route_exclude_address": manual_exc}, ""
+    exclude = list(manual_exc)
+    for ip in sorted(_protected_ips):           # belt and braces: carve the protected hosts out of every range
+        try:
+            a = ipaddress.ip_address(ip)
+            if a.version == 4 and any(a in ipaddress.ip_network(r) for r in include):
+                exclude.append(f"{ip}/32")
+        except ValueError:
+            pass
+    return {"route_address": routes, "route_exclude_address": sorted(set(exclude)), "dropped": dropped}, ""
 
 
 # ============================================================================
@@ -2573,6 +2870,8 @@ def cleanup_leftovers() -> list:
         "    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; \"process:$n\" }\n"
         "}\n"
         "if (Get-NetAdapter -Name 'DiscordProxy' -ErrorAction SilentlyContinue) { 'adapter' }\n"
+        "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object { $_.Comment -eq 'DiscordProxy' } | "
+        "Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue\n"
     )
     found = []
     try:
@@ -4071,6 +4370,159 @@ _LOG_DISCORD_RE = re.compile("|".join(re.escape(s) for s in DISCORD_DOMAIN_SUFFI
 PLACEHOLDER = "Paste a proxy link (vless://, vmess://, trojan://, ss://...) or outbound JSON."
 
 
+
+# ============================================================================
+# NETWORK SAFETY HELPERS (keep the game's traffic out of the tunnel)
+# ============================================================================
+
+_NATIVE_FLAGS = _NO_WINDOW | (0x00008000 if os.name == "nt" else 0)   # no window + ABOVE_NORMAL priority
+TUN_IP = "172.19.0.1"                        # address of the 'DiscordProxy' TUN adapter
+_bypass_routes: set = set()
+
+
+def process_ids(names_lower) -> list:
+    """PIDs of running processes whose exe name (lower case) is in names_lower."""
+    if os.name != "nt":
+        return []
+    running_process_names()                       # makes sure the Toolhelp API is initialised
+    if _PROC_API is None:
+        return []
+    try:
+        k32, PE = _PROC_API
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap in (None, 0, -1) or snap == ctypes.c_void_p(-1).value:
+            return []
+        out = []
+        try:
+            pe = PE()
+            pe.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                if pe.szExeFile.lower() in names_lower:
+                    out.append(int(pe.th32ProcessID))
+                ok = k32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            k32.CloseHandle(snap)
+        return out
+    except Exception:
+        return []
+
+
+def _run_native(cmd, timeout: int = 30) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           creationflags=_NATIVE_FLAGS)
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+def route_table() -> list:
+    ip4 = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+    rows = []
+    for line in _run_native(["route", "print", "-4"], 20).splitlines():
+        p = line.split()
+        if len(p) == 5 and ip4.match(p[0]) and ip4.match(p[1]) and ip4.match(p[3]) and p[4].isdigit():
+            rows.append((p[0], p[1], p[2], p[3], int(p[4])))
+    return rows
+
+
+def best_route(ip: str, table: list):
+    ipn = struct.unpack(">I", socket.inet_aton(ip))[0]
+    best = None
+    for dest, mask, gw, ifip, met in table:
+        m = struct.unpack(">I", socket.inet_aton(mask))[0]
+        d = struct.unpack(">I", socket.inet_aton(dest))[0]
+        if (ipn & m) == (d & m):
+            key = (bin(m).count("1"), -met)
+            if best is None or key > best[0]:
+                best = (key, (dest, mask, gw, ifip, met))
+    return best[1] if best else None
+
+
+def _if_label(ifip: str) -> str:
+    return "DiscordProxy" if ifip == TUN_IP else f"main({ifip})"
+
+
+def route_check(ips) -> dict:
+    """Which interface Windows picks for each destination (from the real routing table)."""
+    table = route_table()
+    res = {}
+    for ip in [i for i in ips if i]:
+        try:
+            r = best_route(ip, table)
+        except Exception:
+            r = None
+        if r:
+            res[ip] = (_if_label(r[3]), r[2])
+    return res
+
+
+def default_gateway() -> str:
+    table = [r for r in route_table() if r[3] != TUN_IP]
+    try:
+        r = best_route("1.1.1.1", table)
+    except Exception:
+        r = None
+    return r[2] if r and re.match(r"^\d+\.\d+\.\d+\.\d+$", r[2]) else ""
+
+
+def game_peers(limit: int = 3) -> list:
+    pids = set(process_ids({n.lower() for n in GAME_PROCESS_NAMES}))
+    if not pids:
+        return []
+    peers, seen = [], set()
+    for line in _run_native(["netstat", "-ano", "-p", "tcp"], 25).splitlines():
+        p = line.split()
+        if len(p) >= 5 and p[0].upper() == "TCP" and p[3].upper() == "ESTABLISHED" and p[4].isdigit() \
+                and int(p[4]) in pids:
+            host, _, port = p[2].rpartition(":")
+            if not port.isdigit() or ":" in host:
+                continue
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                continue
+            if host not in seen:
+                seen.add(host)
+                peers.append((host, int(port)))
+    return peers[:limit]
+
+
+def dns_scope_ok() -> bool:
+    """True when the DNS scope is intact: NRPT rule present and the TUN adapter has no DNS server of its own.
+    (A test report showed 16 foreign lookups still passing the tunnel: sing-box/Windows had reset it.)"""
+    if os.name != "nt":
+        return True
+    out = _run_native(["netsh", "interface", "ipv4", "show", "dnsservers", "name=DiscordProxy"], 15)
+    low = out.lower()
+    if not out.strip() or "not found" in low or "no such" in low:
+        return True                               # adapter not there (yet): nothing to verify
+    has_dns = bool(re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", out))
+    reg = _run_native(["reg", "query", r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig", "/s"], 15)
+    return ("DiscordProxy" in reg) and not has_dns
+
+
+def bypass_add(ip: str) -> bool:
+    """Direct /32 route for one address, more specific than any tunnel range, so it can never enter the TUN."""
+    gw = default_gateway()
+    if not gw or ip in _bypass_routes:
+        return ip in _bypass_routes
+    out = _run_native(["route", "add", ip, "mask", "255.255.255.255", gw, "metric", "1"], 15)
+    if "OK" in out.upper():
+        _bypass_routes.add(ip)
+        return True
+    return False
+
+
+def bypass_clear() -> None:
+    for ip in list(_bypass_routes):
+        _run_native(["route", "delete", ip], 15)
+    _bypass_routes.clear()
+
+
 class DiscordProxyApp(tk.Tk):
     def __init__(self, single=None, start_hidden: bool = False):
         super().__init__()
@@ -4541,12 +4993,97 @@ class DiscordProxyApp(tk.Tk):
         variant = get_running_discord_variant()
         self._set_discord_label(variant)
         try:
+            self._game_guard_step()
             self._watchdog_step(variant is not None)
             if self._settings.get("theme", "auto") == "auto" and windows_prefers_dark() != self._is_dark:
                 self._apply_theme()  # Windows switched between light and dark
         except Exception as ex:
             self._append_log(f"--- watchdog error: {ex} ---")
         self.after(3000, self._status_tick)
+
+    def _scope_watch_step(self):
+        """Every 30 s: if the DNS scope was reset (sing-box / Windows re-added the TUN DNS, or the rule is
+        gone), apply it again, so the game's lookups keep going straight to your main connection's DNS."""
+        if not (self._want_running and self._manager.is_running):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_scope_t", 0.0) < 30 or getattr(self, "_scope_busy", False):
+            return
+        self._scope_t = now
+        self._scope_busy = True
+
+        def work():
+            try:
+                if not dns_scope_ok():
+                    res = dns_scope_apply()
+                    self._event_queue.put(("log", "--- DNS scope: had been lost (reset by Windows or sing-box) - "
+                                                  "re-applied: " + res + " ---"))
+            except Exception:
+                pass
+            finally:
+                self._scope_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _route_audit_step(self):
+        """Every 15 s while a game is open: the game's servers and your DNS relay must NOT be routed into the
+        tunnel. If Windows would send one there, a direct /32 route is added for it (removed when the proxy stops)."""
+        now = time.monotonic()
+        if now - getattr(self, "_audit_t", 0.0) < 15 or getattr(self, "_audit_busy", False):
+            return
+        self._audit_t = now
+        self._audit_busy = True
+
+        def work():
+            try:
+                ips = [p[0] for p in game_peers(8)] + list(get_main_dns_servers())
+                for ip, (ifn, _gw) in route_check(ips).items():
+                    if ifn == "DiscordProxy":
+                        ok = bypass_add(ip)
+                        self._event_queue.put(("log", f"--- ROUTE AUDIT: {ip} (game server / DNS relay) was routed into "
+                                                      f"the tunnel - " + ("a direct /32 route was added ---" if ok else
+                                                                          "could NOT add a direct route (check Administrator) ---")))
+            except Exception:
+                pass
+            finally:
+                self._audit_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+
+    def _game_guard_step(self):
+        """A game (GAME_PROCESS_NAMES) is running -> keep the tunnel out of its way."""
+        game = game_running()
+        if game:
+            # sing-box + xray use ~1 CPU-second per minute; at ABOVE_NORMAL they are never starved when the
+            # game keeps every core at 100% (starved = DNS/Discord steps taking >1 s)
+            set_priority(proxy_pids(self), 0x00008000)
+        self._scope_watch_step()
+        was = getattr(self, "_game_active", None)
+        self._game_active = game
+        if bool(game) != bool(was):
+            if game:
+                self._append_log(f"--- game guard: {game} detected - no 'capture everything' and no automatic tunnel "
+                                 f"restarts until the game closes (the proxy processes run at above-normal priority) ---")
+                if self._want_running and self._manager.is_running:
+                    threading.Thread(target=dns_scope_apply, daemon=True).start()
+            else:
+                self._append_log("--- game guard: game closed - normal operation ---")
+        # ---- the tunnel must never carry the game's traffic
+        if game and self._want_running and self._manager.is_running:
+            if (getattr(self, "_capture_active", "") == "all" and not getattr(self, "_revert_pending", False)
+                    and not getattr(self, "_recovering", False)):
+                # 'capture everything' (voice fallback / learning run) was active when the game opened:
+                # every game packet would pass through sing-box. Go back to Discord-only right now.
+                self._revert_pending = True
+                self._force_all = False
+                self._voice_return_gen += 1
+                self._append_log("--- game guard: a game opened while 'capture everything' was active - "
+                                 "restarting the tunnel in Discord-only mode ---")
+                self._restart_chain(delay=1.0)
+            elif getattr(self, "_capture_active", "") != "all":
+                self._revert_pending = False
+            self._route_audit_step()
+        if not game:
+            self._revert_pending = False
 
     def _set_status(self, label: ttk.Label, name: str, ok: bool, detail: str):
         dot = "●" if ok else "○"
@@ -5526,6 +6063,22 @@ class DiscordProxyApp(tk.Tk):
             self._append_log(f"--- session total: ↑ {fmt_bytes(up)} uploaded, ↓ {fmt_bytes(down)} downloaded "
                              f"({fmt_bytes(up + down)} total) ---")
 
+    # ------------------------------------------------------------- test mode (diagnostic edition)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def export_log(self):
         if not self._log_lines:
             messagebox.showinfo("Discord Proxy", "The log is empty.")
@@ -5702,6 +6255,8 @@ class DiscordProxyApp(tk.Tk):
         cidr = learn_range_from_log_line(line)
         if cidr:
             self._learn_range(cidr)
+            if EARLY_RETURN_AFTER_LEARN and self._force_all:
+                self._schedule_early_return(cidr)
             # Voice fallback is only a short learning pass: as soon as Discord's UDP voice
             # media shows up (its range is now saved), go back to Discord-only capture
             # instead of keeping TeamSpeak/Steam/games inside the tunnel for the whole call.
@@ -5798,6 +6353,12 @@ class DiscordProxyApp(tk.Tk):
             self._voice_fallback()
 
     def _voice_fallback(self):
+        if getattr(self, "_game_active", None):
+            # Capturing everything would push the game's traffic through the TUN (extra latency,
+            # jitter). Discord voice may be imperfect this match; the range is learned for next time.
+            self._log_note("--- voice check: voice server outside the learned ranges, but a game is running - "
+                           "NOT capturing everything (keeps your game ping); retry after the match ---")
+            return
         self._force_all = True
         self._log_note("--- voice check: NO UDP voice media in the tunnel - this voice server is outside the "
                        "learned ranges (it would go direct: ping spike, then 'connection lost'). Capturing "
@@ -5845,7 +6406,7 @@ class DiscordProxyApp(tk.Tk):
         # call is over = voice UDP was flowing and has now been gone for 3 checks (~30 s);
         # if it never came back after the restart, give up waiting after 3 minutes
         if st["idle"] >= 3 and (st["seen"] or waited > 180):
-            if self._voice_call_active():      # mid-call guard: never restart under a running call
+            if self._voice_call_active() or getattr(self, "_game_active", None):   # never restart mid-call / mid-match
                 st["idle"] = 0
             else:
                 self._voice_return()
@@ -5874,12 +6435,21 @@ class DiscordProxyApp(tk.Tk):
         configured_mode = mode
         pref = self._settings.get("strict_route", "auto")
         capture: dict = {}
-        if mode == "discord" and self._force_all:
+        game_open = bool(game_running())
+        if mode == "all" and game_open:
+            self._append_log("--- capture mode: 'Everything' is configured but a game is running - using Discord "
+                             "destinations only, so the game's traffic never enters the tunnel ---")
+            mode = configured_mode = "discord"
+        if mode == "discord" and self._force_all and not game_open:
             self._append_log("--- capture mode: voice fallback - capturing everything for the rest of this run ---")
             mode = "all"
         if mode == "discord":
             routes, reason = compute_discord_capture(self._learned)
-            if routes is None:
+            if routes is None and game_open:
+                self._append_log(f"--- capture mode: {reason}; a game is running, so NOT capturing everything - only "
+                                 f"Discord's names are tunnelled (add voice ranges to discord_ranges.txt) ---")
+                capture.update({"route_address": [FAKEIP_RANGE], "route_exclude_address": []})
+            elif routes is None:
                 self._append_log(f"--- capture mode: {reason}; capturing everything this run "
                                  f"(Discord's ranges are learned from it) ---")
                 if "ranges" in reason and not self._learning_note_shown:
@@ -5889,12 +6459,24 @@ class DiscordProxyApp(tk.Tk):
                 mode = "all"
             else:
                 capture.update(routes)
+                for r in routes.get("dropped", []):
+                    self._append_log(f"--- capture mode: range {r} ignored (private network, or it contains your DNS "
+                                     f"relay / the game's servers) ---")
         self._capture_active = mode
         # Learning pass = "Discord only" is configured but this run had to capture everything
         # (ranges unknown / voice fallback). The kill switch arms only once that pass is over.
         self._learning_run = (configured_mode == "discord" and mode == "all")
-        strict = (mode == "all") if pref == "auto" else (pref == "on")
+        # "Auto" no longer turns strict_route on: it blocks the user's own DNS on the main
+        # connection (game cannot connect / resolves a different server). Only an explicit "On" does.
+        strict = (pref == "on")
         capture["strict_route"] = strict
+        main_dns = get_main_dns_servers()
+        if main_dns:
+            capture["main_dns"] = main_dns
+            self._append_log(f"--- DNS for everything except Discord: your main connection's DNS "
+                             f"{main_dns[0]} (unchanged) ---")
+        else:
+            self._append_log("--- main connection's DNS could not be detected; using the Windows resolver ---")
         capture["stack"] = self._settings.get("tun_stack", "mixed")
         capture["mtu"] = int(self._settings.get("tun_mtu", "1500"))
         if mode == "discord":
