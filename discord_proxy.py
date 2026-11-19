@@ -100,10 +100,11 @@ from xml.sax.saxutils import escape as xml_escape
 OUTBOUND_TAG = "user-proxy"
 DISCORD_PROCESS_NAMES = ["Discord.exe", "DiscordPTB.exe", "DiscordCanary.exe"]
 # While one of these is running (you are in a match) the "game guard" keeps the tunnel out of its way:
-# Discord-only capture (never "capture everything"), no automatic tunnel restarts, the proxy processes
-# run at above-normal priority, DNS scoped to Discord names, and the game's servers are checked to stay
-# out of the tunnel. Check the exact .exe name in Task Manager (Details tab); add yours if it differs.
-GAME_PROCESS_NAMES = ["bf6.exe", "bf6event.exe", "battlefield6.exe", "battlefield 6.exe"]
+# Discord-only capture (never "capture everything"), no automatic tunnel restarts, DNS scoped to Discord
+# names, the game's own flows are routed direct and its servers are carved out of the tunnel (TCP and UDP).
+# Add more games (exact .exe name from Task Manager > Details) to dp_data/game_processes.txt, one per line;
+# that file is merged into this list at start-up.
+GAME_PROCESS_NAMES = ["cs2.exe", "bf6.exe", "bf6event.exe", "battlefield6.exe", "battlefield 6.exe"]
 # Resolved per Windows user: %LOCALAPPDATA% -> C:\Users\<current user>\AppData\Local
 DISCORD_DEFAULT_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
@@ -1134,6 +1135,49 @@ def _is_probe_flow(md: dict) -> bool:
             and str(md.get("destinationPort") or "") == str(PROBE_DEST[1]))
 
 
+def _flow_exe(md: dict) -> str:
+    """Lower-case exe name of the process that owns a sing-box connection ('' when sing-box did not resolve it)."""
+    path = str(md.get("processPath") or "")
+    return path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_game_flow(md: dict) -> bool:
+    exe = _flow_exe(md)
+    return bool(exe) and exe in {n.lower() for n in GAME_PROCESS_NAMES}
+
+
+def game_tunnel_flows(port: int, secret: str):
+    """Destination IPs of the game's own flows that sing-box can see (they only get there when the game's
+    server sits inside a captured range). Returns (ips, any_process_info) or None if the stats API is unreachable."""
+    import urllib.request
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/connections",
+                                     headers={"Authorization": f"Bearer {secret}"})
+        with opener.open(req, timeout=2) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    fake = ipaddress.ip_network(FAKEIP_RANGE)
+    ips, seen_info = [], False
+    for c in data.get("connections") or []:
+        md = c.get("metadata") or {}
+        if md.get("processPath"):
+            seen_info = True
+        if not _is_game_flow(md):
+            continue
+        try:
+            ip = ipaddress.ip_address(md.get("destinationIP") or "")
+        except ValueError:
+            continue
+        if (ip.version != 4 or ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_unspecified or ip in fake):
+            continue
+        if str(ip) not in ips:
+            ips.append(str(ip))
+    return ips, seen_info
+
+
 def singbox_clean(ob: dict) -> dict:
     """Drops our private \"_xxx\" helper keys, which sing-box would reject."""
     return {k: v for k, v in ob.items() if not k.startswith("_")}
@@ -1283,7 +1327,10 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
         # Only Discord's own destinations are routed into the TUN in this mode, so route them to the
         # proxy by destination as well, whatever the process lookup says.
         real = [r for r in capture["route_address"] if r != FAKEIP_RANGE]
-        extra = [{"domain_suffix": DISCORD_DOMAIN_SUFFIXES, "outbound": "proxy"}]
+        # the game itself never takes the proxy, whatever range its server sits in (first, so the
+        # destination rules below cannot catch it); needs the process lookup to succeed
+        extra = [{"process_name": list(GAME_PROCESS_NAMES), "outbound": "direct"},
+                 {"domain_suffix": DISCORD_DOMAIN_SUFFIXES, "outbound": "proxy"}]
         if real:
             # voice media only (UDP, Discord's media ports): another program that happens to talk to the
             # same Cloudflare-sized range (TCP, or UDP on other ports) is never pushed to the proxy
@@ -1318,6 +1365,15 @@ def _build_singbox_config_core(user_outbound: dict, api: dict | None = None, cap
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _PS_FLAGS = _NO_WINDOW | (0x00008000 if os.name == "nt" else 0)   # PowerShell at ABOVE_NORMAL: a game at 100% CPU must not starve it
+_GAME_OPEN = False   # set by the game guard; periodic background helpers drop to BELOW_NORMAL while it is True
+
+
+def _helper_flags(critical: bool = False) -> int:
+    """Creation flags for helper processes. Critical ones (route add, DNS scope) stay ABOVE_NORMAL; the
+    periodic audits run BELOW_NORMAL while a game is open so they never steal CPU from the match."""
+    if os.name != "nt":
+        return 0
+    return _NO_WINDOW | (0x00008000 if (critical or not _GAME_OPEN) else 0x00004000)
 
 
 # ============================================================================
@@ -2411,6 +2467,39 @@ def ensure_manual_ranges_file() -> str:
     return path
 
 
+_GAME_LIST_TEMPLATE = (
+    "# Extra game executables for the game guard, one exe name per line (exact name from\n"
+    "# Task Manager > Details), e.g.  mygame.exe\n"
+    "# While one of them runs: no capture-everything, no tunnel restarts, the game's flows go direct and its\n"
+    "# servers are kept out of the tunnel. This file is yours and is never overwritten.\n"
+)
+
+
+def game_processes_path() -> str:
+    return os.path.join(config_dir(), "game_processes.txt")
+
+
+def load_game_process_names() -> None:
+    """Merges dp_data/game_processes.txt into GAME_PROCESS_NAMES (in place)."""
+    path = game_processes_path()
+    try:
+        if not os.path.exists(path):
+            os.makedirs(config_dir(), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_GAME_LIST_TEMPLATE)
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    have = {n.lower() for n in GAME_PROCESS_NAMES} | {n.lower() for n in DISCORD_PROCESS_NAMES}
+    for raw in lines:
+        name = raw.split("#", 1)[0].strip()
+        if name and name.lower().endswith(".exe") and name.lower() not in have:
+            GAME_PROCESS_NAMES.append(name)
+            have.add(name.lower())
+
+
 def read_ranges_file(path: str):
     """Returns (include, exclude) lists of normalised CIDR strings."""
     include, exclude = [], []
@@ -2441,6 +2530,9 @@ _LEARN_RE = re.compile(
 # DNS servers of the user's main connection (filled in by get_main_dns_servers). Their
 # neighbourhood is never learned or routed as a Discord range.
 _protected_ips: set = set()
+# Game servers seen (TCP peers, and UDP flows sing-box attributed to the game). Unlike _protected_ips they
+# only get a /32 carved out of the tunnel ranges; the Discord range that contains them is kept.
+_game_server_ips: set = set()
 
 
 _PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
@@ -2507,7 +2599,7 @@ def udp_voice_flowing(port: int, secret: str):
         md = c.get("metadata") or {}
         if str(md.get("network", "")).lower() != "udp":
             continue
-        if OUTBOUND_TAG not in (c.get("chains") or []) or _is_probe_flow(md):
+        if OUTBOUND_TAG not in (c.get("chains") or []) or _is_probe_flow(md) or _is_game_flow(md):
             continue
         try:
             ip = ipaddress.ip_address(md.get("destinationIP") or "")
@@ -2560,14 +2652,14 @@ def get_system_dns_servers() -> list:
 _main_dns_cache = (0.0, [])
 
 
-def get_main_dns_servers() -> list:
+def get_main_dns_servers(background: bool = False) -> list:
     """IPv4 DNS servers of the MAIN connection (the adapter that owns the default route,
     ignoring this program's own TUN adapter), primary first. [] if it cannot be told."""
     global _main_dns_cache
     if os.name != "nt":
         return []
     now = time.monotonic()
-    if _main_dns_cache[1] and now - _main_dns_cache[0] < 30:
+    if _main_dns_cache[1] and now - _main_dns_cache[0] < (120 if _GAME_OPEN else 30):
         return list(_main_dns_cache[1])
     ps = ("$best = Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected "
           "-ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -ne 'DiscordProxy' } | "
@@ -2580,7 +2672,7 @@ def get_main_dns_servers() -> list:
     try:
         out = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            capture_output=True, text=True, timeout=20, creationflags=_PS_FLAGS,
+            capture_output=True, text=True, timeout=20, creationflags=_helper_flags(critical=not background),
         ).stdout
     except Exception:
         return list(_main_dns_cache[1])          # last known good beats nothing (PowerShell starved by a game)
@@ -2622,7 +2714,7 @@ def compute_discord_capture(learned):
     if game_running():                          # never route a running game's servers into the tunnel
         try:
             for ip, _port in game_peers(8):
-                _protected_ips.add(ip)
+                _game_server_ips.add(ip)
         except Exception:
             pass
     dropped = []
@@ -2642,7 +2734,7 @@ def compute_discord_capture(learned):
         if r not in routes:
             routes.append(r)
     exclude = list(manual_exc)
-    for ip in sorted(_protected_ips):           # belt and braces: carve the protected hosts out of every range
+    for ip in sorted(_protected_ips | _game_server_ips):   # belt and braces: carve the protected hosts out of every range
         try:
             a = ipaddress.ip_address(ip)
             if a.version == 4 and any(a in ipaddress.ip_network(r) for r in include):
@@ -3160,7 +3252,7 @@ class VoiceStallWatchdog:
         md = c.get("metadata") or {}
         if str(md.get("network", "")).lower() != "udp" or OUTBOUND_TAG not in (c.get("chains") or []):
             return False
-        if _is_probe_flow(md):
+        if _is_probe_flow(md) or _is_game_flow(md):
             return False
         try:
             ip = ipaddress.ip_address(md.get("destinationIP") or "")
@@ -4408,10 +4500,10 @@ def process_ids(names_lower) -> list:
         return []
 
 
-def _run_native(cmd, timeout: int = 30) -> str:
+def _run_native(cmd, timeout: int = 30, critical: bool = False) -> str:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
-                           creationflags=_NATIVE_FLAGS)
+                           creationflags=_helper_flags(critical))
         return r.stdout or ""
     except Exception:
         return ""
@@ -4510,7 +4602,7 @@ def bypass_add(ip: str) -> bool:
     gw = default_gateway()
     if not gw or ip in _bypass_routes:
         return ip in _bypass_routes
-    out = _run_native(["route", "add", ip, "mask", "255.255.255.255", gw, "metric", "1"], 15)
+    out = _run_native(["route", "add", ip, "mask", "255.255.255.255", gw, "metric", "1"], 15, critical=True)
     if "OK" in out.upper():
         _bypass_routes.add(ip)
         return True
@@ -4519,7 +4611,7 @@ def bypass_add(ip: str) -> bool:
 
 def bypass_clear() -> None:
     for ip in list(_bypass_routes):
-        _run_native(["route", "delete", ip], 15)
+        _run_native(["route", "delete", ip], 15, critical=True)
     _bypass_routes.clear()
 
 
@@ -4547,6 +4639,7 @@ class DiscordProxyApp(tk.Tk):
         self._event_queue: "queue.Queue[tuple]" = queue.Queue()
         self._log_lines = collections.deque(maxlen=50000)
         self._settings = load_settings()
+        load_game_process_names()
         self._restore_geometry()
         self._active_core = ""
         self._tray: TrayIcon | None = None
@@ -5007,7 +5100,7 @@ class DiscordProxyApp(tk.Tk):
         if not (self._want_running and self._manager.is_running):
             return
         now = time.monotonic()
-        if now - getattr(self, "_scope_t", 0.0) < 30 or getattr(self, "_scope_busy", False):
+        if now - getattr(self, "_scope_t", 0.0) < (60 if _GAME_OPEN else 30) or getattr(self, "_scope_busy", False):
             return
         self._scope_t = now
         self._scope_busy = True
@@ -5035,7 +5128,7 @@ class DiscordProxyApp(tk.Tk):
 
         def work():
             try:
-                ips = [p[0] for p in game_peers(8)] + list(get_main_dns_servers())
+                ips = [p[0] for p in game_peers(8)] + list(get_main_dns_servers(background=True))
                 for ip, (ifn, _gw) in route_check(ips).items():
                     if ifn == "DiscordProxy":
                         ok = bypass_add(ip)
@@ -5049,13 +5142,51 @@ class DiscordProxyApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
 
+    def _game_udp_step(self):
+        """Every 3 s while a game is open: the game's flows that sing-box sees (so its server sits inside a
+        captured range) get a direct /32 route, and the server is carved out of the ranges at the next
+        tunnel start. Uses only sing-box's local stats API (no subprocess), so it is cheap."""
+        api = self._api
+        now = time.monotonic()
+        if not api or now - getattr(self, "_udp_t", 0.0) < 3 or getattr(self, "_udp_busy", False):
+            return
+        self._udp_t = now
+        self._udp_busy = True
+
+        def work():
+            try:
+                res = game_tunnel_flows(api["port"], api["secret"])
+                if res is None:
+                    return
+                ips, seen_info = res
+                if not ips and not seen_info and not getattr(self, "_udp_warned", False):
+                    self._udp_warned = True
+                    self._event_queue.put(("log", "--- game guard: sing-box reported no process path for any "
+                                                  "connection, so the game's flows cannot be attributed (the "
+                                                  "game-direct rule needs the process lookup) ---"))
+                for ip in ips[:8]:
+                    if ip in _bypass_routes or len(_bypass_routes) >= 64:
+                        _game_server_ips.add(ip)
+                        continue
+                    _game_server_ips.add(ip)
+                    ok = bypass_add(ip)
+                    self._event_queue.put(("log", f"--- game guard: {ip} (game server) was inside the tunnel ranges - "
+                                                  + ("a direct /32 route was added ---" if ok else
+                                                     "could NOT add a direct route (check Administrator) ---")))
+            except Exception:
+                pass
+            finally:
+                self._udp_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
     def _game_guard_step(self):
         """A game (GAME_PROCESS_NAMES) is running -> keep the tunnel out of its way."""
+        global _GAME_OPEN
         game = game_running()
-        if game:
-            # sing-box + xray use ~1 CPU-second per minute; at ABOVE_NORMAL they are never starved when the
-            # game keeps every core at 100% (starved = DNS/Discord steps taking >1 s)
-            set_priority(proxy_pids(self), 0x00008000)
+        _GAME_OPEN = bool(game)
+        # sing-box + xray use ~1 CPU-second per minute; at ABOVE_NORMAL they are never starved when a game
+        # keeps every core at 100% (starved = Discord voice ping climbing). Always on, not only for listed games.
+        set_priority(proxy_pids(self), 0x00008000)
         self._scope_watch_step()
         was = getattr(self, "_game_active", None)
         self._game_active = game
@@ -5082,6 +5213,7 @@ class DiscordProxyApp(tk.Tk):
             elif getattr(self, "_capture_active", "") != "all":
                 self._revert_pending = False
             self._route_audit_step()
+            self._game_udp_step()
         if not game:
             self._revert_pending = False
 
@@ -6267,6 +6399,16 @@ class DiscordProxyApp(tk.Tk):
     def _learn_range(self, cidr: str):
         """Remembers a destination range Discord used (for 'Discord only' mode)."""
         if cidr in self._learned or len(self._learned) >= LEARNED_MAX:
+            return
+        if getattr(self, "_game_active", None):
+            # a UDP flow seen in the proxy chain while a game runs may be the game, not Discord voice:
+            # learning its /16 would keep that whole block inside the tunnel for every later session
+            skipped = self.__dict__.setdefault("_learn_skipped", set())
+            if cidr not in skipped:
+                skipped.add(cidr)
+                self._log_lines.append(f"--- range {cidr} seen while a game is running - not learned "
+                                       f"(could be the game; it is learned on the next call outside a match) ---")
+                self._log_total += 1
             return
         self._learned.add(cidr)
         try:
