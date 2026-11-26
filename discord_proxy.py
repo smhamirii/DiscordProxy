@@ -86,10 +86,12 @@ import tkinter as tk
 import urllib.error
 import urllib.request
 import webbrowser
+import weakref
 import zipfile
 import zlib
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import font as tkfont
 from urllib.parse import urlsplit, parse_qsl, unquote
 from xml.sax.saxutils import escape as xml_escape
 
@@ -2828,11 +2830,19 @@ def icon_resource_bytes(size: int, rgba: bytes) -> bytes:
 # Theme
 # ============================================================================
 
-LIGHT_PALETTE = {"fg": "#1a1a1a", "muted": "#666666", "field": "#ffffff", "field_fg": "#111111",
-                 "sel": "#cce4ff", "ok": "#2e7d32", "warn": "#b26a00"}
-DARK_PALETTE = {"bg": "#1e1f22", "fg": "#e3e5e8", "muted": "#9a9ea6", "field": "#2b2d31",
-                "field_fg": "#f2f3f5", "btn": "#3a3d44", "btn_hover": "#4a4e57", "border": "#3f4248",
-                "sel": "#3b5bdb", "ok": "#57d38c", "warn": "#f0b232"}
+LIGHT_PALETTE = {
+    "bg": "#ffffff", "card": "#f4f5f7", "fg": "#313338", "muted": "#5c5e66", "field": "#e9ebee",
+    "field_fg": "#060607", "btn": "#e3e5e8", "btn_hover": "#d4d7dc", "border": "#d4d7dc", "sel": "#c9d3fb",
+    "ok": "#1a7f45", "warn": "#a8620a", "bad": "#d83c3e", "accent": "#5865f2", "accent_hover": "#4752c4",
+    "accent_fg": "#ffffff", "go": "#248046", "go_hover": "#1a6334", "stop": "#da373c", "stop_hover": "#a12828",
+    "pill_fg": "#ffffff", "glow1": "#5865f2", "glow2": "#eb459e", "glow3": "#2ec4b6"}
+# Discord-style dark palette: #313338 window, #2b2d31 cards, #1e1f22 inputs, #5865f2 blurple accent.
+DARK_PALETTE = {
+    "bg": "#313338", "card": "#2b2d31", "fg": "#dbdee1", "muted": "#949ba4", "field": "#1e1f22",
+    "field_fg": "#f2f3f5", "btn": "#4e5058", "btn_hover": "#6d6f78", "border": "#3f4147", "sel": "#404249",
+    "ok": "#23a55a", "warn": "#f0b232", "bad": "#f23f42", "accent": "#5865f2", "accent_hover": "#4752c4",
+    "accent_fg": "#ffffff", "go": "#23a55a", "go_hover": "#1a7f45", "stop": "#da373c", "stop_hover": "#a12828",
+    "card_line": "#2b2d31", "pill_fg": "#1e1f22", "glow1": "#5865f2", "glow2": "#eb459e", "glow3": "#2ec4b6"}
 
 
 def windows_prefers_dark() -> bool:
@@ -2845,6 +2855,602 @@ def windows_prefers_dark() -> bool:
             return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
     except Exception:
         return False
+
+
+# ============================================================================
+# Rounded buttons and the blurred backdrop (pure Tk + stdlib, no Pillow)
+# ============================================================================
+
+_BTN_PAL: dict = dict(DARK_PALETTE)       # kept in sync with the active theme by RoundButton.retheme()
+
+
+def _hex_rgb(h: str):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    ra, rb = _hex_rgb(a), _hex_rgb(b)
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(ra, rb))
+
+
+def _png_from_rows(w: int, h: int, rows: bytes) -> bytes:
+    """RGBA PNG from rows that already start with their filter byte."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+_ROUND_CACHE: dict = {}
+
+
+def _round_img(w: int, h: int, r: int, top: str, bottom: str):
+    """Anti-aliased rounded rectangle with a soft vertical gradient (alpha PNG)."""
+    key = (w, h, r, top, bottom)
+    img = _ROUND_CACHE.get(key)
+    if img is not None:
+        return img
+    if len(_ROUND_CACHE) > 300:
+        _ROUND_CACHE.clear()               # buttons keep their own reference to the image they show
+    t, b = _hex_rgb(top), _hex_rgb(bottom)
+    rows = bytearray()
+    hw, hh = w / 2.0, h / 2.0
+    for y in range(h):
+        f = y / max(1, h - 1)
+        cr, cg, cb = (round(t[i] + (b[i] - t[i]) * f) for i in range(3))
+        qy = abs(y + 0.5 - hh) - (hh - r)
+        rows.append(0)
+        for x in range(w):
+            qx = abs(x + 0.5 - hw) - (hw - r)
+            d = math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+            a = max(0.0, min(1.0, 0.5 - d))
+            rows.extend((cr, cg, cb, int(a * 255 + 0.5)))
+    img = tk.PhotoImage(data=base64.b64encode(_png_from_rows(w, h, bytes(rows))))
+    _ROUND_CACHE[key] = img
+    return img
+
+
+def build_backdrop(width: int, height: int, pal: dict, scale: int = 3, lift: float = 0.0):
+    """Soft blurred colour glow: a few large gaussian blobs over the window colour. Computed at 1/scale
+    size and enlarged by Tk, so it costs a fraction of a second and needs no imaging library."""
+    w, h = width // scale + 1, height // scale + 1
+    base0 = _hex_rgb(pal["bg"])
+    k = 1.0 - lift                     # lift: blend this much white in (the lighter card variant)
+    base = tuple(base0[i] * k + 255.0 * lift for i in range(3))
+    blobs = []
+    for cx, cy, sig, key, strength in ((0.10, 0.05, 0.60, "glow1", 0.30), (1.00, 0.40, 0.48, "glow2", 0.17),
+                                        (0.25, 1.00, 0.60, "glow3", 0.20)):
+        s2 = 2.0 * (sig * w) ** 2
+        gx = [math.exp(-((x - cx * w) ** 2) / s2) for x in range(w)]
+        gy = [math.exp(-((y - cy * h) ** 2) / s2) for y in range(h)]
+        col = _hex_rgb(pal[key])
+        blobs.append((gx, gy, [(col[i] - base0[i]) * strength * k for i in range(3)]))
+    (gx1, gy1, d1), (gx2, gy2, d2), (gx3, gy3, d3) = blobs
+    rows = bytearray()
+    for y in range(h):
+        rows.append(0)
+        a1, a2, a3 = gy1[y], gy2[y], gy3[y]
+        for x in range(w):
+            k1, k2, k3 = gx1[x] * a1, gx2[x] * a2, gx3[x] * a3
+            n = ((x * 73 + y * 151) % 7) / 7.0 - 0.5          # ordered dither: no visible banding
+            rows.extend((max(0, min(255, int(base[0] + k1 * d1[0] + k2 * d2[0] + k3 * d3[0] + 0.5 + n))),
+                         max(0, min(255, int(base[1] + k1 * d1[1] + k2 * d2[1] + k3 * d3[1] + 0.5 + n))),
+                         max(0, min(255, int(base[2] + k1 * d1[2] + k2 * d2[2] + k3 * d3[2] + 0.5 + n))), 255))
+    small = tk.PhotoImage(data=base64.b64encode(_png_from_rows(w, h, bytes(rows))))
+    return small.zoom(scale, scale)
+
+
+class RoundButton(tk.Canvas):
+    """Rounded, gradient, hover-aware button (Tk has no native rounded buttons). Mimics the few ttk.Button
+    methods the app uses: state([...]), invoke(), configure(text=/state=/command=), cget()."""
+    _all: "weakref.WeakSet" = weakref.WeakSet()
+    _KINDS = {"secondary": ("btn", "btn_hover", "fg"), "go": ("go", "go_hover", "#ffffff"),
+              "stop": ("stop", "stop_hover", "#ffffff"), "accent": ("accent", "accent_hover", "#ffffff")}
+
+    def __init__(self, master, text="", command=None, kind="secondary", height=34, pad=12,
+                 surface="card", font=("Segoe UI Semibold", 9)):
+        tk.Canvas.__init__(self, master, width=1, height=height, highlightthickness=0, bd=0, takefocus=1)
+        self._text, self._cmd, self._kind, self._surface = text, command, kind, surface
+        self._disabled = self._hover = self._down = self._focus = False
+        self._backdrop = None
+        self._img = None
+        self._font = tkfont.Font(font=font)
+        tk.Canvas.configure(self, width=self._font.measure(text) + 2 * pad, cursor="hand2",
+                            bg=_BTN_PAL["card"] if surface == "card" else _BTN_PAL["bg"])
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, down=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(down=True))
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", lambda e: self._set(focus=True))
+        self.bind("<FocusOut>", lambda e: self._set(focus=False))
+        self.bind("<space>", lambda e: self.invoke())
+        self.bind("<Return>", lambda e: self.invoke())
+        RoundButton._all.add(self)
+
+    # ---- ttk.Button-like API
+    def state(self, spec=None):
+        if spec is None:
+            return ("disabled",) if self._disabled else ()
+        for s in ([spec] if isinstance(spec, str) else spec):
+            if s == "disabled":
+                self._disabled = True
+            elif s == "!disabled":
+                self._disabled = False
+        self._hover = self._hover and not self._disabled
+        self._down = self._down and not self._disabled
+        tk.Canvas.configure(self, cursor="arrow" if self._disabled else "hand2")
+        self._redraw()
+        return ()
+
+    def instate(self, spec, callback=None):
+        want_disabled = "disabled" in spec
+        return self._disabled == want_disabled
+
+    def invoke(self):
+        if not self._disabled and self._cmd:
+            return self._cmd()
+
+    def configure(self, cnf=None, **kw):
+        opts = dict(cnf or {}, **kw)
+        if not opts:
+            return tk.Canvas.configure(self)
+        if "text" in opts:
+            self._text = opts.pop("text")
+            tk.Canvas.configure(self, width=self._font.measure(self._text) + 24)
+        if "command" in opts:
+            self._cmd = opts.pop("command")
+        if "kind" in opts:
+            self._kind = opts.pop("kind")
+        if "state" in opts:
+            self.state(["disabled"] if opts.pop("state") == "disabled" else ["!disabled"])
+        if opts:
+            tk.Canvas.configure(self, **opts)
+        self._redraw()
+
+    config = configure
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "command":
+            return self._cmd
+        if key == "state":
+            return "disabled" if self._disabled else "normal"
+        return tk.Canvas.cget(self, key)
+
+    # ---- appearance
+    @classmethod
+    def retheme(cls, pal: dict):
+        _BTN_PAL.clear()
+        _BTN_PAL.update(pal)
+        for b in list(cls._all):
+            try:
+                tk.Canvas.configure(b, bg=pal["card"] if b._surface == "card" else pal["bg"])
+                b._redraw()
+            except tk.TclError:
+                pass
+
+    def set_backdrop(self, img):
+        """Slice of the window backdrop behind this button (only for buttons that sit on it, not on a card)."""
+        self._backdrop = img
+        self._redraw()
+
+    def _set(self, **flags):
+        for k, v in flags.items():
+            setattr(self, "_" + k, v)
+        self._redraw()
+
+    def _on_release(self, e):
+        was = self._down
+        self._set(down=False)
+        if was and not self._disabled and 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height():
+            self.invoke()
+
+    def _colors(self):
+        p = _BTN_PAL
+        if self._disabled:
+            fill = _mix(p["card"], p["fg"], 0.07)
+            return fill, fill, p["muted"]
+        base_key, over_key, fg = self._KINDS[self._kind]
+        c = p[base_key]
+        if self._down:
+            c = _mix(p[over_key], "#000000", 0.18)
+        elif self._hover or self._focus:
+            c = p[over_key]
+        return c, c, p.get(fg, fg)
+
+    def _redraw(self):
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 8 or h < 8:
+                return
+            top, bottom, fg = self._colors()
+            self.delete("all")
+            if self._backdrop is not None:
+                self.create_image(0, 0, anchor="nw", image=self._backdrop)
+            self._img = _round_img(w, h, 8 if h >= 32 else 6, top, bottom)
+            self.create_image(0, 0, anchor="nw", image=self._img)
+            self.create_text(w // 2, h // 2 + (1 if self._down else 0), text=self._text, fill=fg, font=self._font)
+        except tk.TclError:
+            pass
+
+
+_CARD_LIFT = 0.06            # how much lighter a card is than the window behind it (white blended in)
+_IMG_CACHE: dict = {}
+
+
+def _aa(d: float) -> float:
+    """Anti-aliased coverage from a signed distance (negative = inside)."""
+    return max(0.0, min(1.0, 0.5 - d))
+
+
+def _card_img(w: int, h: int, r: int, fill: tuple, line: tuple):
+    """Rounded card: translucent fill + 1px outline, anti-aliased. Rows that repeat are built only once."""
+    key = ("card", w, h, r, fill, line)
+    img = _IMG_CACHE.get(key)
+    if img is not None:
+        return img
+    if len(_IMG_CACHE) > 120:
+        _IMG_CACHE.clear()
+    hw, hh = w / 2.0, h / 2.0
+
+    def px(x, y):
+        qx = abs(x + 0.5 - hw) - (hw - r)
+        qy = abs(y + 0.5 - hh) - (hh - r)
+        d = math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+        la = (_aa(d) - _aa(d + 1.0)) * line[3] / 255.0
+        fa = _aa(d + 1.0) * fill[3] / 255.0
+        a = la + fa * (1.0 - la)
+        if a <= 0.0:
+            return bytes((0, 0, 0, 0))
+        return bytes([int((line[i] * la + fill[i] * fa * (1.0 - la)) / a + 0.5) for i in range(3)]
+                     + [int(a * 255 + 0.5)])
+
+    def row(y):
+        left = [px(x, y) for x in range(r)]
+        return b"\x00" + b"".join(left) + px(r, y) * (w - 2 * r) + b"".join(reversed(left))
+
+    top = [row(y) for y in range(r)]
+    mid = row(r) if h > 2 * r else b""
+    rows = b"".join(top) + mid * max(0, h - 2 * r) + b"".join(reversed(top))
+    img = tk.PhotoImage(data=base64.b64encode(_png_from_rows(w, h, rows)))
+    _IMG_CACHE[key] = img
+    return img
+
+
+def _power_img(size: int, top: str, bottom: str, glow, icon: str = "#ffffff", glow_a: float = 0.55):
+    """Round power button: gradient disc, soft glow ring and an anti-aliased power symbol."""
+    key = ("power", size, top, bottom, glow, icon, glow_a)
+    img = _IMG_CACHE.get(key)
+    if img is not None:
+        return img
+    m = 8
+    c = size / 2.0
+    R = c - m
+    ri, t = R * 0.42, R * 0.12
+    t_rgb, b_rgb, i_rgb = _hex_rgb(top), _hex_rgb(bottom), _hex_rgb(icon)
+    g_rgb = _hex_rgb(glow) if glow else (0, 0, 0)
+    gap = math.radians(38)
+    rows = bytearray()
+    for y in range(size):
+        f = max(0.0, min(1.0, (y - (c - R)) / (2 * R)))
+        base = [t_rgb[i] + (b_rgb[i] - t_rgb[i]) * f for i in range(3)]
+        rows.append(0)
+        dy = y + 0.5 - c
+        for x in range(size):
+            dx = x + 0.5 - c
+            dist = math.hypot(dx, dy)
+            d = dist - R
+            disc = _aa(d)
+            ga = 0.0
+            if glow and d > 0.0:
+                ga = glow_a * math.exp(-(d / 4.5) ** 2)
+            ang = math.atan2(dx, -dy)
+            ring = _aa(abs(dist - ri) - t / 2) if abs(ang) > gap else 0.0
+            seg_y = max(-ri * 1.12, min(-ri * 0.05, dy))
+            bar = _aa(math.hypot(dx, dy - seg_y) - t / 2)
+            ic = max(ring, bar) * disc
+            col = [base[i] * (1 - ic) + i_rgb[i] * ic for i in range(3)]
+            a = disc + ga * (1.0 - disc)
+            if a <= 0.0:
+                rows.extend((0, 0, 0, 0))
+                continue
+            if disc < 1.0:                      # blend glow colour in at the soft edge
+                wgt = disc / a
+                col = [col[i] * wgt + g_rgb[i] * (1 - wgt) for i in range(3)]
+            rows.extend((int(col[0] + 0.5), int(col[1] + 0.5), int(col[2] + 0.5), int(a * 255 + 0.5)))
+    img = tk.PhotoImage(data=base64.b64encode(_png_from_rows(size, size, bytes(rows))))
+    _IMG_CACHE[key] = img
+    return img
+
+
+class PowerButton(tk.Canvas):
+    """Large round connect/disconnect button. mode: 'off' (grey), 'connecting' (amber), 'on' (green)."""
+    def __init__(self, master, command=None, size=104):
+        tk.Canvas.__init__(self, master, width=size + 16, height=size + 16, highlightthickness=0, bd=0,
+                           cursor="hand2", takefocus=1)
+        self._size, self._cmd = size + 16, command
+        self._mode, self._hover, self._down = "off", False, False
+        self._pulse_hi, self._pulse_job = True, None
+        self.bind("<Destroy>", lambda e: self._stop_pulse() if e.widget is self else None)
+        self._surface = "glass"
+        self._backdrop = None
+        self._img = None
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, down=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(down=True))
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<space>", lambda e: self._cmd and self._cmd())
+        self.bind("<Return>", lambda e: self._cmd and self._cmd())
+        RoundButton._all.add(self)
+        tk.Canvas.configure(self, bg=_BTN_PAL["bg"])
+        self._redraw()
+
+    def set_mode(self, mode):
+        if mode != self._mode:
+            self._mode = mode
+            self._stop_pulse()
+            if mode == "connecting":
+                self._pulse_tick()
+            self._redraw()
+
+    def _stop_pulse(self):
+        if self._pulse_job is not None:
+            try:
+                self.after_cancel(self._pulse_job)
+            except tk.TclError:
+                pass
+            self._pulse_job = None
+        self._pulse_hi = True
+
+    def _pulse_tick(self):
+        self._pulse_hi = not self._pulse_hi          # the glow breathes while connecting
+        self._redraw()
+        try:
+            self._pulse_job = self.after(550, self._pulse_tick)
+        except tk.TclError:
+            self._pulse_job = None
+
+    def set_backdrop(self, img):
+        self._backdrop = img
+        self._redraw()
+
+    def _set(self, **flags):
+        for k, v in flags.items():
+            setattr(self, "_" + k, v)
+        self._redraw()
+
+    def _on_release(self, e):
+        was = self._down
+        self._set(down=False)
+        if was and 0 <= e.x < self._size and 0 <= e.y < self._size and self._cmd:
+            self._cmd()
+
+    def _redraw(self):
+        try:
+            p = _BTN_PAL
+            if self._mode == "on":
+                c, glow = p["ok"], p["ok"]
+            elif self._mode == "connecting":
+                c, glow = p["warn"], p["warn"]
+            else:
+                c, glow = p["btn"], None
+            if self._down:
+                c = _mix(c, "#000000", 0.18)
+            elif self._hover:
+                c = _mix(c, "#ffffff", 0.14)
+            self.delete("all")
+            if self._backdrop is not None:
+                self.create_image(0, 0, anchor="nw", image=self._backdrop)
+            self._img = _power_img(self._size, _mix(c, "#ffffff", 0.14), _mix(c, "#000000", 0.10), glow,
+                                   glow_a=(0.55 if self._pulse_hi else 0.16))
+            self.create_image(0, 0, anchor="nw", image=self._img)
+        except tk.TclError:
+            pass
+
+
+class ToggleSwitch(tk.Canvas):
+    """Discord-style on/off switch with its label. Stands in for ttk.Checkbutton: same text/variable/command
+    options, plus state([...]) and configure(command=/state=/text=)."""
+    TRACK_W, TRACK_H = 38, 22
+
+    def __init__(self, master, text="", variable=None, command=None, surface="glass", wraplength=440):
+        tk.Canvas.__init__(self, master, highlightthickness=0, bd=0, takefocus=1, cursor="hand2")
+        self._text, self._var, self._cmd, self._surface = text, variable, command, surface
+        self._wrap = wraplength
+        self._disabled = False
+        self._font = tkfont.Font(font=("Segoe UI", 9))
+        self._pos = 1.0 if self._on() else 0.0
+        self._job = None
+        self._trace = None
+        self._img_track = self._img_knob = None
+        tk.Canvas.configure(self, bg=_BTN_PAL["card"] if surface == "card" else _BTN_PAL["bg"])
+        self._measure()
+        self._redraw()
+        self.bind("<Button-1>", lambda e: self.invoke())
+        self.bind("<space>", lambda e: self.invoke())
+        self.bind("<Destroy>", self._on_destroy)
+        if variable is not None:
+            self._trace = variable.trace_add("write", lambda *a: self._sync())
+        RoundButton._all.add(self)
+
+    def _on(self):
+        try:
+            return bool(self._var.get()) if self._var is not None else False
+        except tk.TclError:
+            return False
+
+    def _on_destroy(self, e):
+        if e.widget is self:
+            if self._job is not None:
+                try:
+                    self.after_cancel(self._job)
+                except tk.TclError:
+                    pass
+            if self._var is not None and self._trace is not None:
+                try:
+                    self._var.trace_remove("write", self._trace)
+                except (tk.TclError, ValueError):
+                    pass
+
+    def _measure(self):
+        tx = self.TRACK_W + 10
+        probe = self.create_text(0, 0, text=self._text, anchor="nw", font=self._font, width=max(80, self._wrap - tx))
+        bb = self.bbox(probe) or (0, 0, 0, 0)
+        self.delete(probe)
+        self._tx, self._th = tx, bb[3] - bb[1]
+        tk.Canvas.configure(self, width=tx + (bb[2] - bb[0]) + 2, height=max(self.TRACK_H + 4, self._th + 4))
+
+    def _sync(self):
+        self._animate(1.0 if self._on() else 0.0)
+
+    def _animate(self, target):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        step = (target - self._pos) / 4.0
+
+        def tick(n=4):
+            self._job = None
+            self._pos = target if n <= 1 else self._pos + step
+            self._redraw()
+            if n > 1:
+                try:
+                    self._job = self.after(16, tick, n - 1)
+                except tk.TclError:
+                    pass
+        tick()
+
+    def invoke(self):
+        if self._disabled or self._var is None:
+            return
+        self._var.set(not self._on())               # the trace animates the knob
+        if self._cmd:
+            self._cmd()
+
+    def state(self, spec=None):
+        if spec is None:
+            return ("disabled",) if self._disabled else ()
+        for s in ([spec] if isinstance(spec, str) else spec):
+            if s == "disabled":
+                self._disabled = True
+            elif s == "!disabled":
+                self._disabled = False
+        tk.Canvas.configure(self, cursor="arrow" if self._disabled else "hand2")
+        self._redraw()
+        return ()
+
+    def configure(self, cnf=None, **kw):
+        opts = dict(cnf or {}, **kw)
+        if not opts:
+            return tk.Canvas.configure(self)
+        if "command" in opts:
+            self._cmd = opts.pop("command")
+        if "state" in opts:
+            self.state(["disabled"] if opts.pop("state") == "disabled" else ["!disabled"])
+        if "text" in opts:
+            self._text = opts.pop("text")
+            self._measure()
+        if opts:
+            tk.Canvas.configure(self, **opts)
+        self._redraw()
+
+    config = configure
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "command":
+            return self._cmd
+        if key == "state":
+            return "disabled" if self._disabled else "normal"
+        return tk.Canvas.cget(self, key)
+
+    def set_backdrop(self, img):
+        pass
+
+    def _redraw(self):
+        try:
+            p = _BTN_PAL
+            surface = p["card"] if self._surface == "card" else p["bg"]
+            off = _mix(p["btn_hover"], p["muted"], 0.35)
+            track = _mix(off, p["ok"], self._pos)
+            fg = p["fg"]
+            if self._disabled:
+                track = _mix(track, surface, 0.6)
+                fg = p["muted"]
+            h = int(float(tk.Canvas.cget(self, "height")))
+            tw, th = self.TRACK_W, self.TRACK_H
+            ty = (h - th) // 2
+            kd = th - 6
+            self.delete("all")
+            self._img_track = _round_img(tw, th, th // 2, track, track)
+            self._img_knob = _round_img(kd, kd, kd // 2, "#ffffff" if not self._disabled else "#d0d3d8",
+                                        "#ffffff" if not self._disabled else "#d0d3d8")
+            self.create_image(0, ty, anchor="nw", image=self._img_track)
+            self.create_image(3 + self._pos * (tw - kd - 6), ty + 3, anchor="nw", image=self._img_knob)
+            self.create_text(self._tx, h // 2, text=self._text, anchor="w", font=self._font, fill=fg,
+                             width=max(80, self._wrap - self._tx))
+        except (tk.TclError, ValueError):
+            pass
+
+
+class StatTile(tk.Canvas):
+    """Rounded tile: caption on top, big value, optional small second line and a coloured accent bar."""
+    def __init__(self, master, caption, height=54, accent=None, sub=False):
+        tk.Canvas.__init__(self, master, width=10, height=height, highlightthickness=0, bd=0)
+        self._cap, self._val, self._color = caption, "0 B", None
+        self._sub = "" if sub else None
+        self._accent = accent                     # palette key ("accent", "ok", ...) or None
+        self._surface = "card"
+        self._img = self._bar = None
+        tk.Canvas.configure(self, bg=_BTN_PAL["card"])
+        self.bind("<Configure>", lambda e: self._redraw())
+        RoundButton._all.add(self)
+
+    def set_value(self, text, color=None, sub=None):
+        self._val, self._color = text, color
+        if sub is not None:
+            self._sub = sub
+        self._redraw()
+
+    def set_backdrop(self, img):
+        pass
+
+    def _redraw(self):
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 24 or h < 24:
+                return
+            p = _BTN_PAL
+            self.delete("all")
+            self._img = _round_img(w, h, 10, p["field"], p["field"])
+            self.create_image(0, 0, anchor="nw", image=self._img)
+            x = 12
+            if self._accent:
+                col = p[self._accent]
+                self._bar = _round_img(4, max(8, h - 24), 2, col, col)
+                self.create_image(9, 12, anchor="nw", image=self._bar)
+                x = 22
+            three = self._sub is not None
+            self.create_text(x, h * (0.25 if three else 0.30), text=self._cap, anchor="w", fill=p["muted"],
+                             font=("Segoe UI", 8, "bold"))
+            self.create_text(x, h * (0.54 if three else 0.68), text=self._val, anchor="w",
+                             fill=self._color or p["fg"], font=("Segoe UI", 12, "bold"))
+            if three:
+                self.create_text(x, h * 0.83, text=self._sub, anchor="w", fill=p["muted"], font=("Segoe UI", 8))
+        except tk.TclError:
+            pass
+
+
+def DialogButton(master, text="", command=None, kind="secondary"):
+    """Rounded button for dialogs and the Settings window (sits on the plain window colour)."""
+    return RoundButton(master, text=text, command=command, kind=kind, height=32, pad=16, surface="glass")
 
 
 # ============================================================================
@@ -4751,50 +5357,219 @@ class DiscordProxyApp(tk.Tk):
 
     # ---------------------------------------------------------------- UI
 
+    # ------------------------------------------------ transparent building blocks
+
+    def _glass_frame(self, parent):
+        """A Frame with a canvas placed behind its content; the canvas shows this frame's slice of the
+        blurred backdrop, so the frame looks transparent. The frame still sizes itself around its children."""
+        pal = self._pal
+        fr = tk.Frame(parent, bg=pal["bg"], bd=0, highlightthickness=0)
+        cv = tk.Canvas(fr, bg=pal["bg"], highlightthickness=0, bd=0)
+        cv.place(x=0, y=0, relwidth=1, relheight=1)
+        self._glass.append(cv)
+        fr._glass_cv = cv
+        return fr
+
+    def _card(self, parent, expand=False, pack=True, **pack_opts):
+        """Frosted rounded card. Returns the inner frame to put widgets in (inner._outer is the card)."""
+        outer = self._glass_frame(parent)
+        self._card_cvs.append(outer._glass_cv)
+        if pack:
+            outer.pack(fill="both" if expand else "x", expand=expand, **pack_opts)
+        inner = self._glass_frame(outer)
+        inner._card_inner = True                    # everything inside is drawn on the lighter card backdrop
+        inner.pack(fill="both", expand=True, padx=12, pady=12)
+        inner._outer = outer
+        return inner
+
+    def _tlabel(self, parent, fg="fg", **kw):
+        """Label whose background follows the backdrop colour behind it. fg: palette key, or None when the
+        app colours the text itself (status dots, voice quality...)."""
+        pal = self._pal
+        kw.setdefault("font", ("Segoe UI", 9))
+        if "foreground" not in kw:
+            kw["fg"] = pal[fg] if fg else pal["fg"]
+        lbl = tk.Label(parent, bg=pal["bg"], bd=0, highlightthickness=0, padx=0, pady=0, **kw)
+        self._tints.append((lbl, fg))
+        return lbl
+
+    def _heading(self, parent, text, pady=(0, 6)):
+        self._tlabel(parent, "muted", text=text.upper(), font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=pady)
+
+    def _tframe(self, parent, **kw):
+        fr = tk.Frame(parent, bg=self._pal["bg"], bd=0, highlightthickness=0, **kw)
+        self._tints.append((fr, "frame"))
+        return fr
+
+    def _tcheck(self, parent, **kw):
+        sw = ToggleSwitch(parent, surface="card", wraplength=SIDE_WIDTH - 60, **kw)
+        self._glass_btns.append(sw)
+        return sw
+
+    def _rbtn(self, parent, text, cmd, kind="secondary", height=34, pad=12):
+        b = RoundButton(parent, text=text, command=cmd, kind=kind, height=height, pad=pad, surface="glass")
+        self._glass_btns.append(b)
+        return b
+
+    # ------------------------------------------------ layout
+
+    def _discord_toggle(self):
+        if getattr(self, "_discord_running", False):
+            self.close_discord()
+        else:
+            self.open_discord()
+
+    def _hero_click(self):
+        if self._state in ("running", "starting", "retrying"):
+            self.stop_proxy()
+        else:
+            self.start_proxy()
+
     def _build_ui(self):
-        body = ttk.Frame(self)
+        self._glass: list = []         # canvases that show a slice of the blurred backdrop
+        self._glass_btns: list = []    # rounded buttons (they show the slice behind them too)
+        self._card_cvs: list = []      # canvases of the frosted cards (they also draw the card outline)
+        self._tints: list = []         # labels/checkboxes whose background follows the backdrop
+        self._backdrop = None
+        self._backdrop_card = None
+        self._paint_job = None
+        pal = self._pal
+
+        body = self._glass_frame(self)
         body.pack(fill="both", expand=True)
         body.grid_columnconfigure(0, minsize=WIN_WIDTH)
         body.grid_columnconfigure(1, weight=1, minsize=SIDE_WIDTH)
         body.grid_rowconfigure(0, weight=1)
-        root = ttk.Frame(body, padding=16)
-        root.grid(row=0, column=0, sticky="nsw")
-        wrap = WIN_WIDTH - 40
+        root = self._glass_frame(body)
+        root.grid(row=0, column=0, sticky="nsew")
+        LP = (16, 8)                   # left/right padding of everything in the left column
+        wrap = WIN_WIDTH - 64
 
-        header = ttk.Frame(root)
-        header.pack(fill="x", pady=(0, 10))
-        ttk.Label(header, text="Discord Proxy", font=("Segoe UI", 18, "bold")).pack(side="left")
-        ttk.Button(header, text="Settings", command=self._open_settings).pack(side="right")
+        def card(pady=(0, 10)):
+            return self._card(root, padx=LP, pady=pady)
 
-        # --- status panel ---
-        status_box = ttk.LabelFrame(root, text="Status", padding=10)
-        status_box.pack(fill="x", pady=(0, 10))
-        grid = ttk.Frame(status_box)
+        # --- brand header: logo, title, Settings
+        header = self._glass_frame(root)
+        header.configure(height=46)
+        header.pack(fill="x", padx=LP, pady=(16, 12))
+        hcv = header._glass_cv
+        self._title_cv = hcv
+        self._logo = _round_img(40, 40, 12, "#7983f5", "#d63c8c")
+        hcv.create_image(0, 23, anchor="w", image=self._logo)
+        hcv.create_text(20, 23, text="D", font=("Segoe UI", 16, "bold"), fill="#ffffff")
+        hcv.create_text(52, 14, text="Discord Proxy", anchor="w", font=("Segoe UI", 15, "bold"),
+                        fill=pal["fg"], tags="title")
+        hcv.create_text(52, 33, text="Fast, private voice for Discord", anchor="w", font=("Segoe UI", 8),
+                        fill=pal["muted"], tags="subtitle")
+        self._rbtn(header, "Settings", self._open_settings, height=30).place(relx=1.0, rely=0.5, anchor="e")
+
+        # --- hero: one big connect button, state, core selector, traffic and voice
+        hero = card()
+        top_row = self._glass_frame(hero)
+        top_row.pack(fill="x")
+        self.power_btn = PowerButton(top_row, command=self._hero_click, size=104)
+        self._glass_btns.append(self.power_btn)
+        self.power_btn.pack(side="left")
+        info = self._glass_frame(top_row)
+        info.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        self.lbl_state = self._tlabel(info, None, text="Disconnected", font=("Segoe UI", 18, "bold"))
+        self.lbl_state.pack(anchor="w", pady=(14, 0))
+        self.lbl_hint = self._tlabel(info, "muted", text="Click to connect", font=("Segoe UI", 9))
+        self.lbl_hint.pack(anchor="w", pady=(0, 10))
+        core_row = self._glass_frame(info)
+        core_row.pack(fill="x")
+        self._tlabel(core_row, "muted", text="PROXY CORE", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        saved = self._settings.get("core", "auto")
+        label_for = {v: k for k, v in CORE_CHOICES.items()}
+        self.core_var = tk.StringVar(value=label_for.get(saved, "Auto (recommended)"))
+        self.core_combo = ttk.Combobox(core_row, textvariable=self.core_var, state="readonly",
+                                       values=list(CORE_CHOICES.keys()), width=22)
+        self.core_combo.pack(anchor="w", pady=(3, 0))
+        self.core_combo.bind("<<ComboboxSelected>>", self._on_core_changed)
+
+        # Start/Stop keep their own enabled/disabled state (the app flips it); the hero button drives them.
+        self.btn_start = RoundButton(root, text="Start", command=self.start_proxy)
+        self.btn_stop = RoundButton(root, text="Stop", command=self.stop_proxy)
+        self.btn_stop.state(["disabled"])
+
+        stats = self._glass_frame(hero)
+        stats.pack(fill="x", pady=(12, 0))
+        tiles = self._glass_frame(stats)
+        tiles.pack(fill="x")
+        self._tiles = []
+        for i, (cap, key) in enumerate((("\u2191  UPLOAD", "accent"), ("\u2193  DOWNLOAD", "ok"), ("TOTAL", None))):
+            tiles.grid_columnconfigure(i, weight=1, uniform="tile")
+            t = StatTile(tiles, cap, height=62, accent=key, sub=True)
+            t.set_value("0 B", None, "0 B/s")
+            t.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0 if i == 2 else 4))
+            self._glass_btns.append(t)
+            self._tiles.append(t)
+        self._traffic_vals = (0, 0)
+        self._rate_ref = None
+        self.lbl_traffic = tiles
+
+        vhead = self._glass_frame(stats)
+        vhead.pack(fill="x", pady=(14, 6))
+        self._tlabel(vhead, "muted", text="VOICE CALL", font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.lbl_voice = self._tlabel(vhead, None, text=self._voice_text(*self._voice_last),
+                                      font=("Segoe UI", 9, "bold"))
+        self.lbl_voice.pack(side="right")
+        vtiles = self._glass_frame(stats)
+        vtiles.pack(fill="x")
+        self._vtiles = {}
+        for i, (key, cap) in enumerate((("proxy", "PROXY"), ("ping", "VOICE PING"), ("loss", "PACKET LOSS"))):
+            vtiles.grid_columnconfigure(i, weight=1, uniform="vt")
+            t = StatTile(vtiles, cap, height=48)
+            t.set_value("\u2014")
+            t.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0 if i == 2 else 4))
+            self._glass_btns.append(t)
+            self._vtiles[key] = t
+        self.lbl_voiceq = self._tlabel(stats, "muted", text="", font=("Segoe UI", 8), wraplength=wrap - 24,
+                                       justify="left")
+        self.lbl_voiceq.pack(anchor="w", pady=(6, 0))
+
+        # --- quick actions: one grid, three equal columns, every button the same size ---
+        ctl = card()
+        for c in range(2):
+            ctl.grid_columnconfigure(c, weight=1, uniform="ctl")
+
+        def action(name, text, cmd, kind, r, c):
+            b = self._rbtn(ctl, text, cmd, kind)
+            b.grid(row=r, column=c, sticky="ew", padx=2, pady=3)
+            if name:
+                setattr(self, name, b)
+            return b
+
+        # Test Proxy has no button any more; test_proxy() still flips this hidden one's enabled state.
+        self.btn_test = RoundButton(root, text="Test", command=self.test_proxy)
+        # One button for Discord: "Open Discord" when it is not running, "Close Discord" when it is.
+        action("btn_close_discord", "Open Discord", self._discord_toggle, "accent", 0, 0)
+        action("btn_retry", "Retry", self.retry_connection, "secondary", 0, 1)
+
+        # --- system checks ---
+        status_box = card()
+        self._heading(status_box, "System")
+        grid = self._glass_frame(status_box)
         grid.pack(fill="x")
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
 
-        self.lbl_singbox = ttk.Label(grid, text="● sing-box.exe: checking...")
+        self.lbl_singbox = self._tlabel(grid, None, text="● sing-box.exe: checking...")
         self.lbl_singbox.grid(row=0, column=0, sticky="w")
-        self.lbl_wintun = ttk.Label(grid, text="● wintun.dll: checking...")
+        self.lbl_wintun = self._tlabel(grid, None, text="● wintun.dll: checking...")
         self.lbl_wintun.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.lbl_admin = ttk.Label(grid, text="● Administrator: checking...")
+        self.lbl_admin = self._tlabel(grid, None, text="● Administrator: checking...")
         self.lbl_admin.grid(row=0, column=1, sticky="w")
-        self.lbl_discord = ttk.Label(grid, text="● Discord: checking...")
+        self.lbl_discord = self._tlabel(grid, None, text="● Discord: checking...")
         self.lbl_discord.grid(row=1, column=1, sticky="w", pady=(4, 0))
-        self.lbl_xray = ttk.Label(grid, text="● xray-core: checking...")
+        self.lbl_xray = self._tlabel(grid, None, text="● xray-core: checking...")
         self.lbl_xray.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        btn_row = ttk.Frame(status_box)
-        btn_row.pack(fill="x", pady=(8, 0))
-        ttk.Button(btn_row, text="Re-check", command=self.refresh_all_status).pack(side="left")
-        self.btn_elevate = ttk.Button(btn_row, text="Restart as Administrator", command=self._restart_elevated)
-        self.btn_elevate.pack(side="left", padx=(8, 0))
-        if is_admin():
-            self.btn_elevate.state(["disabled"])
-        self.btn_update = ttk.Button(btn_row, text="Update", command=self._update_components)
-        self.btn_getfiles = ttk.Button(btn_row, text="Get missing files...", command=lambda: self._offer_download())
-        self.update_box = ttk.Frame(status_box)     # "update available" lines (clickable)
+        btn_row = self._glass_frame(status_box)      # only holds the Update button, shown when an update exists
+        btn_row.pack(fill="x")
+        btn_row.grid_columnconfigure(0, weight=1)
+        self.btn_update = self._rbtn(btn_row, "Update", self._update_components, height=30)
+        self.update_box = self._tframe(status_box)     # "update available" lines (clickable); rebuilt on demand
         self.update_box.pack(fill="x")
 
         # --- the active link lives in this hidden box; it is chosen in the server list on the right ---
@@ -4804,80 +5579,41 @@ class DiscordProxyApp(tk.Tk):
         self.input_box.bind("<FocusOut>", self._restore_placeholder)
         self._attach_context_menu(self.input_box)
 
-        # --- proxy core selector ---
-        core_row = ttk.Frame(root)
-        core_row.pack(fill="x", pady=(0, 10))
-        ttk.Label(core_row, text="Proxy core:", font=("Segoe UI", 10, "bold")).pack(side="left")
-        saved = self._settings.get("core", "auto")
-        label_for = {v: k for k, v in CORE_CHOICES.items()}
-        self.core_var = tk.StringVar(value=label_for.get(saved, "Auto (recommended)"))
-        self.core_combo = ttk.Combobox(core_row, textvariable=self.core_var, state="readonly",
-                                       values=list(CORE_CHOICES.keys()), width=22)
-        self.core_combo.pack(side="left", padx=(8, 0))
-        self.core_combo.bind("<<ComboboxSelected>>", self._on_core_changed)
-
-        # --- buttons (two rows so they fit the narrow window) ---
-        btns = ttk.Frame(root)
-        btns.pack(fill="x", pady=(0, 4))
-        self.btn_start = ttk.Button(btns, text="Start Discord Proxy", command=self.start_proxy)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop_proxy, state="disabled")
-        self.btn_stop.pack(side="left", padx=(8, 0))
-        self.btn_test = ttk.Button(btns, text="Test Proxy", command=self.test_proxy)
-        self.btn_test.pack(side="left", padx=(8, 0))
-        self.btn_retry = ttk.Button(btns, text="Retry", command=self.retry_connection)
-        self.btn_retry.pack(side="left", padx=(8, 0))
-        btns2 = ttk.Frame(root)
-        btns2.pack(fill="x", pady=(0, 4))
-        ttk.Button(btns2, text="Open Config Folder", command=self.open_config_folder).pack(side="left")
-        ttk.Button(btns2, text="Export Log (.txt)", command=self.export_log).pack(side="left", padx=(8, 0))
-        btns3 = ttk.Frame(root)
-        btns3.pack(fill="x", pady=(0, 10))
-        ttk.Button(btns3, text="Open Discord", command=self.open_discord).pack(side="left")
-        self.btn_close_discord = ttk.Button(btns3, text="Close Discord", command=self.close_discord)
-        self.btn_close_discord.pack(side="left", padx=(8, 0))
-
-        # --- traffic / voice (the live log is intentionally hidden - use "Export Log (.txt)") ---
-        ttk.Label(root, text="Traffic", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.lbl_traffic = ttk.Label(root, text=self._traffic_text(0, 0), font=("Consolas", 9))
-        self.lbl_traffic.pack(anchor="w", pady=(0, 8))
-
-        ttk.Label(root, text="Voice", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.lbl_voice = ttk.Label(root, text=self._voice_text(*self._voice_last), font=("Consolas", 9))
-        self.lbl_voice.pack(anchor="w", pady=(0, 2))
-        self.lbl_voiceq = ttk.Label(root, text="quality: not running\n ", font=("Consolas", 9), justify="left")
-        self.lbl_voiceq.pack(anchor="w", pady=(0, 8))
-
         # Fixed-height status area (3 lines) so a long status never changes the window size.
-        status_area = ttk.Frame(root, height=52)
-        self._status_area = status_area
-        status_area.pack(fill="x")
-        status_area.pack_propagate(False)
-        self.status_bar = ttk.Label(status_area, text="Status: stopped", font=("Segoe UI", 9, "bold"),
-                                    wraplength=wrap, justify="left")
+        status_area = self._card(root, padx=LP, pady=(0, 16))
+        self._status_area = status_area._outer
+        status_area._outer.configure(height=76)
+        status_area._outer.pack_propagate(False)
+        self.status_bar = self._tlabel(status_area, "fg", text="Status: stopped", font=("Segoe UI", 9, "bold"),
+                                       wraplength=wrap, justify="left")
         self.status_bar.pack(anchor="nw")
 
         self._build_side_panel(body)
+        self.bind("<Map>", lambda e: self._schedule_paint() if e.widget is self else None, add="+")
 
     def _build_side_panel(self, body):
         """Right-hand pane (like v2rayN's server list): saved servers, connection graph, live log."""
-        side = ttk.Frame(body, padding=(0, 16, 16, 16))
+        side = self._glass_frame(body)
         side.grid(row=0, column=1, sticky="nsew")
+        RP = (8, 16)
         self._hist_state = {"open": True}
         self._log_state = {"open": True}
 
         # ---- servers
-        ttk.Label(side, text="Servers", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        tbar = ttk.Frame(side)
-        tbar.pack(fill="x", pady=(4, 4))
-        for text, cmd in (("Paste link(s)", self._links_paste),
-                          ("Remove", self._links_remove), ("\u25b2", lambda: self._links_move(-1)),
-                          ("\u25bc", lambda: self._links_move(1))):
-            ttk.Button(tbar, text=text, command=cmd, width=(3 if len(text) == 1 else None)).pack(side="left", padx=(0, 5))
-        self._btn_testall = ttk.Button(tbar, text="Test all", command=self._links_test_all)
-        self._btn_testall.pack(side="left", padx=(8, 5))
-        ttk.Button(tbar, text="Sort", command=self._links_sort_speed, width=6).pack(side="left")
-        wrap_t = ttk.Frame(side)
+        servers = self._card(side, expand=True, padx=RP, pady=(16, 0))
+        self._heading(servers, "Servers")
+        tbar = self._glass_frame(servers)
+        tbar.pack(fill="x", pady=(0, 8))
+        for i, (text, cmd) in enumerate((("Paste", self._links_paste), ("Remove", self._links_remove),
+                                         ("\u25b2", lambda: self._links_move(-1)),
+                                         ("\u25bc", lambda: self._links_move(1)),
+                                         ("Test all", self._links_test_all), ("Sort", self._links_sort_speed))):
+            tbar.grid_columnconfigure(i, weight=1, uniform="tb")          # six equal buttons
+            b = self._rbtn(tbar, text, cmd, height=28, pad=8)
+            b.grid(row=0, column=i, sticky="ew", padx=2)
+            if text == "Test all":
+                self._btn_testall = b
+        wrap_t = tk.Frame(servers, bd=0, highlightthickness=0)
         wrap_t.pack(fill="both", expand=True)
         tree = ttk.Treeview(wrap_t, columns=("rank", "name", "proto", "addr", "latency", "status"),
                             show="headings", height=7, selectmode="browse")
@@ -4890,10 +5626,11 @@ class DiscordProxyApp(tk.Tk):
         tree.configure(yscrollcommand=tsb.set)
         tsb.pack(side="right", fill="y")
         tree.pack(side="left", fill="both", expand=True)
-        tree.tag_configure("bad", foreground="#d9534f")
-        tree.tag_configure("best", foreground="#2e9b4f")
+        tree.tag_configure("bad", foreground=DARK_PALETTE["bad"])      # re-coloured per theme in _apply_theme
+        tree.tag_configure("best", foreground=DARK_PALETTE["ok"])
         self._links_tree = tree
         menu = tk.Menu(self, tearoff=0)
+        self._themed_menus.append(menu)
         menu.add_command(label="Set as active", command=self._links_use_selected)
         menu.add_command(label="Paste links from clipboard", command=self._links_paste)
         menu.add_separator()
@@ -4922,51 +5659,186 @@ class DiscordProxyApp(tk.Tk):
         tree.bind("<Delete>", lambda e: self._links_remove())
         tree.bind("<Control-v>", lambda e: self._links_paste())
         self._links_status_var = tk.StringVar(value="")
-        ttk.Label(side, textvariable=self._links_status_var, font=("Segoe UI", 8), wraplength=SIDE_WIDTH - 20,
-                  justify="left").pack(anchor="w", pady=(4, 0))
+        self._tlabel(servers, "fg", textvariable=self._links_status_var, font=("Segoe UI", 8),
+                     wraplength=SIDE_WIDTH - 60, justify="left").pack(anchor="w", pady=(6, 0))
         fo_var = tk.BooleanVar(value=bool(self._settings.get("failover", True)))
-        ttk.Checkbutton(side, text="Auto-switch server when the active one stops answering",
-                        variable=fo_var, command=lambda: self._set_setting("failover", fo_var.get())
-                        ).pack(anchor="w", pady=(2, 0))
+        self._tcheck(servers, text="Auto-switch server when the active one stops answering", variable=fo_var,
+                     command=lambda: self._set_setting("failover", fo_var.get())).pack(anchor="w", pady=(2, 0))
 
         # ---- connection history
-        ttk.Label(side, text="Voice ping", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
-        self.hist_canvas = tk.Canvas(side, height=HIST_H, highlightthickness=1, bd=0)
+        hist = self._card(side, padx=RP, pady=(10, 16))
+        self._heading(hist, "Voice ping")
+        chips = self._glass_frame(hist)
+        chips.pack(fill="x", pady=(0, 8))
+        self._hist_tiles = {}
+        for i, (key, cap) in enumerate((("avg", "AVERAGE"), ("max", "PEAK"), ("lossy", "LOSSY"))):
+            chips.grid_columnconfigure(i, weight=1, uniform="ht")
+            t = StatTile(chips, cap, height=46)
+            t.set_value("\u2014")
+            t.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0 if i == 2 else 4))
+            self._glass_btns.append(t)
+            self._hist_tiles[key] = t
+        self.hist_canvas = tk.Canvas(hist, height=HIST_H, highlightthickness=1, bd=0)
         self.hist_canvas.pack(fill="x")
         self.hist_canvas.bind("<Configure>", lambda e: self._redraw_history())
-        self.lbl_hist = ttk.Label(side, text="", font=("Segoe UI", 8), wraplength=SIDE_WIDTH - 20, justify="left")
-        self.lbl_hist.pack(anchor="w", pady=(2, 0))
 
         # ---- live log (packed only when switched on in Settings)
-        self._log_outer = ttk.Frame(side)
-        ttk.Label(self._log_outer, text="Live log", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
-        lb = self._log_outer
-        row1 = ttk.Frame(lb)
+        lb = self._card(side, pack=False)
+        self._log_outer = lb._outer
+        self._heading(lb, "Live log")
+        row1 = self._glass_frame(lb)
         row1.pack(fill="x")
-        ttk.Label(row1, text="Search:").pack(side="left")
+        self._tlabel(row1, "fg", text="Search:").pack(side="left")
         self._log_query = tk.StringVar()
+        bf = self._glass_frame(row1)
+        bf.pack(side="right")
+        bf.grid_columnconfigure(0, weight=1, uniform="lg")
+        bf.grid_columnconfigure(1, weight=1, uniform="lg")
+        self._rbtn(bf, "Clear", self._log_clear_view, height=28, pad=10).grid(row=0, column=0, sticky="ew")
+        self._rbtn(bf, "Copy", self._log_copy, height=28, pad=10).grid(row=0, column=1, sticky="ew", padx=(6, 0))
         ttk.Entry(row1, textvariable=self._log_query).pack(side="left", fill="x", expand=True, padx=(6, 6))
         self._log_errors = tk.BooleanVar(value=False)
         self._log_discord = tk.BooleanVar(value=False)
-        ttk.Button(row1, text="Clear", width=6, command=self._log_clear_view).pack(side="left")
-        ttk.Button(row1, text="Copy", width=6, command=self._log_copy).pack(side="left", padx=(6, 0))
-        row2 = ttk.Frame(lb)
-        row2.pack(fill="x", pady=(2, 0))
-        ttk.Checkbutton(row2, text="Errors only", variable=self._log_errors, command=self._log_refilter).pack(side="left")
-        ttk.Checkbutton(row2, text="Discord only", variable=self._log_discord,
-                        command=self._log_refilter).pack(side="left", padx=(10, 0))
-        tf = ttk.Frame(lb)
-        tf.pack(fill="both", expand=True, pady=(4, 0))
-        self.log_text = tk.Text(tf, height=9, width=10, wrap="word", font=("Consolas", 8), state="disabled")
+        row2 = self._glass_frame(lb)
+        row2.pack(fill="x", pady=(4, 0))
+        self._tcheck(row2, text="Errors only", variable=self._log_errors,
+                     command=self._log_refilter).pack(side="left")
+        self._tcheck(row2, text="Discord only", variable=self._log_discord,
+                     command=self._log_refilter).pack(side="left", padx=(10, 0))
+        tf = tk.Frame(lb, bd=0, highlightthickness=0)
+        tf.pack(fill="both", expand=True, pady=(6, 0))
+        self.log_text = tk.Text(tf, height=9, width=10, wrap="word", font=("Consolas", 8), state="disabled",
+                                bd=0, highlightthickness=0, padx=6, pady=4)
         log_sb = ttk.Scrollbar(tf, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_sb.set)
         log_sb.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
-        self.lbl_logcount = ttk.Label(lb, text="", font=("Segoe UI", 8))
+        self.lbl_logcount = self._tlabel(lb, "fg", text="", font=("Segoe UI", 8))
         self.lbl_logcount.pack(anchor="e")
-        self.log_text.tag_configure("err", foreground="#d9534f")
-        self.log_text.tag_configure("warn", foreground="#e0a030")
+        self.log_text.tag_configure("err", foreground=DARK_PALETTE["bad"])
+        self.log_text.tag_configure("warn", foreground=DARK_PALETTE["warn"])
         self._log_query.trace_add("write", lambda *_a: self._log_schedule_refilter())
+
+    # ------------------------------------------------ blurred backdrop
+
+    def _schedule_paint(self):
+        if getattr(self, "_paint_job", None) is not None:
+            return
+        try:
+            self._paint_job = self.after_idle(self._paint_job_run)
+        except tk.TclError:
+            self._paint_job = None
+
+    def _paint_job_run(self):
+        self._paint_job = None
+        self._paint_backdrop()
+
+    def _in_card(self, w):
+        while w is not None:
+            if getattr(w, "_card_inner", False):
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _backdrop_crop(self, widget):
+        """The part of the backdrop that lies behind `widget` (None when there is no backdrop / not laid out).
+        Inside a card it is the lighter variant, so the card reads as frosted glass."""
+        img = self._backdrop_card if self._in_card(widget) else self._backdrop
+        if img is None:
+            return None
+        try:
+            w, h = widget.winfo_width(), widget.winfo_height()
+            if w <= 1 or h <= 1:
+                return None
+            x = widget.winfo_rootx() - self.winfo_rootx()
+            y = widget.winfo_rooty() - self.winfo_rooty()
+            iw, ih = img.width(), img.height()
+            x1, y1 = max(0, min(x, iw - 1)), max(0, min(y, ih - 1))
+            x2, y2 = min(iw, x + w), min(ih, y + h)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            out = tk.PhotoImage()
+            self.tk.call(str(out), "copy", str(img), "-from", x1, y1, x2, y2)
+            return out
+        except tk.TclError:
+            return None
+
+    def _surface_color(self, widget):
+        return self._pal["card"] if self._in_card(widget) else self._pal["bg"]
+
+    def _backdrop_color(self, widget):
+        """Backdrop colour at the centre of `widget` (the flat surface colour when there is no backdrop)."""
+        img = self._backdrop_card if self._in_card(widget) else self._backdrop
+        if img is not None:
+            try:
+                x = widget.winfo_rootx() - self.winfo_rootx() + widget.winfo_width() // 2
+                y = widget.winfo_rooty() - self.winfo_rooty() + widget.winfo_height() // 2
+                if 0 <= x < img.width() and 0 <= y < img.height():
+                    v = img.get(x, y)
+                    if isinstance(v, str):
+                        v = tuple(int(t) for t in v.split())
+                    return "#%02x%02x%02x" % tuple(v[:3])
+            except (tk.TclError, ValueError, TypeError):
+                pass
+        return self._surface_color(widget)
+
+    def _paint_backdrop(self):
+        pal = self._pal
+        try:
+            self._title_cv.itemconfigure("title", fill=pal["fg"])
+            self._title_cv.itemconfigure("subtitle", fill=pal["muted"])
+        except (tk.TclError, AttributeError):
+            pass
+        cards = set(str(c) for c in getattr(self, "_card_cvs", []))
+        for cv in getattr(self, "_glass", []):
+            try:
+                cv.configure(bg=self._surface_color(cv))
+                cv.delete("bg")
+                cv.delete("card")
+                crop = self._backdrop_crop(cv)
+                if crop is not None:
+                    cv._bg_ref = crop                       # Tk drops an image nobody references
+                    cv.create_image(0, 0, anchor="nw", image=crop, tags="bg")
+                    cv.tag_lower("bg")
+                if str(cv) in cards:
+                    w, h = cv.winfo_width(), cv.winfo_height()
+                    if w > 30 and h > 30:
+                        if self._backdrop is not None:
+                            fill = (255, 255, 255, int(255 * _CARD_LIFT + 0.5))
+                            line = (255, 255, 255, 48)
+                        else:
+                            fill = _hex_rgb(pal["card"]) + (255,)
+                            line = _hex_rgb(pal.get("card_line", pal["border"])) + (255,)
+                        ring = _card_img(w, h, 12, fill, line)
+                        cv._ring_ref = ring
+                        cv.create_image(0, 0, anchor="nw", image=ring, tags="card")
+            except tk.TclError:
+                pass
+        for b in getattr(self, "_glass_btns", []):
+            try:
+                b.configure(bg=self._surface_color(b))
+            except tk.TclError:
+                continue
+            b.set_backdrop(self._backdrop_crop(b))
+        alive = []
+        for w, role in getattr(self, "_tints", []):
+            try:
+                c = self._backdrop_color(w)
+                if role == "frame":
+                    w.configure(bg=c)
+                elif role == "check":
+                    w.configure(bg=c, activebackground=c, fg=pal["fg"], activeforeground=pal["fg"],
+                                selectcolor=pal["field"])
+                elif role:
+                    w.configure(bg=c, fg=pal[role])
+                else:
+                    w.configure(bg=c)                       # status colours are set by the app: keep those
+                    if str(w.cget("fg")).lower() in (LIGHT_PALETTE["fg"], DARK_PALETTE["fg"], "black", "systemwindowtext"):
+                        w.configure(fg=pal["fg"])
+                alive.append((w, role))
+            except tk.TclError:
+                pass                                        # widget was destroyed (e.g. update labels)
+        self._tints = alive
 
     def _fit_window(self):
         """Fixed window: narrow and tall, sized to fit every component. Not resizable."""
@@ -4983,6 +5855,7 @@ class DiscordProxyApp(tk.Tk):
                     self.geometry(f"{TOTAL_WIDTH}x{h}")
         except tk.TclError:
             pass
+        self._schedule_paint()
 
     def _clear_placeholder(self, _event=None):
         if self.input_box.get("1.0", "end-1c") == PLACEHOLDER:
@@ -5064,19 +5937,33 @@ class DiscordProxyApp(tk.Tk):
             }[check["name"]]
             self._set_status(label, check["name"], check["ok"], check["detail"])
         try:
-            if self._missing_components():
-                if not self.btn_getfiles.winfo_ismapped():
-                    self.btn_getfiles.pack(side="left", padx=(8, 0))
-            elif self.btn_getfiles.winfo_ismapped():
-                self.btn_getfiles.pack_forget()
+            missing = self._missing_components()
+            for comp, label in (("sing-box", self.lbl_singbox), ("wintun", self.lbl_wintun),
+                                ("xray", self.lbl_xray)):
+                self._set_download_link(label, comp, comp in missing)
         except tk.TclError:
             pass
         self._refresh_discord_status()
+
+    def _set_download_link(self, label, comp, missing):
+        """A missing file's row becomes a link: clicking it opens the download dialog, which asks first."""
+        if missing:
+            label.configure(text=label.cget("text") + "  (download)", cursor="hand2", foreground=self._pal["warn"])
+            label.bind("<Button-1>", lambda e, c=comp: self._offer_download(preselect=[c]))
+        else:
+            label.configure(cursor="")
+            label.unbind("<Button-1>")
 
     def _refresh_discord_status(self):
         self._set_discord_label(get_running_discord_variant())
 
     def _set_discord_label(self, variant):
+        self._discord_running = variant is not None
+        btn = getattr(self, "btn_close_discord", None)
+        if btn is not None:
+            text = "Close Discord" if variant else "Open Discord"
+            if btn.cget("text") != text:
+                btn.configure(text=text, kind="secondary" if variant else "accent")
         self._set_status(self.lbl_discord, "Discord", variant is not None,
                          "running" if variant else "not running")
 
@@ -5088,7 +5975,7 @@ class DiscordProxyApp(tk.Tk):
         try:
             self._game_guard_step()
             self._watchdog_step(variant is not None)
-            if self._settings.get("theme", "auto") == "auto" and windows_prefers_dark() != self._is_dark:
+            if self._settings.get("theme", "dark") == "auto" and windows_prefers_dark() != self._is_dark:
                 self._apply_theme()  # Windows switched between light and dark
         except Exception as ex:
             self._append_log(f"--- watchdog error: {ex} ---")
@@ -5731,6 +6618,7 @@ class DiscordProxyApp(tk.Tk):
         if self._tray:
             self._tray.set_state(state, icon_state, tips.get(state, "Discord Proxy"))
         self._apply_window_icon(icon_state)
+        self._update_pill()
 
     def _notify(self, title: str, text: str, kind: str = "info"):
         if not self._settings.get("notifications", True):
@@ -6145,30 +7033,60 @@ class DiscordProxyApp(tk.Tk):
         return f"{bps / 1024:.1f} kB/s"
 
     def _voice_text(self, state: str, up: float, down: float, resets: int) -> str:
-        if self._ping_ms is None:
-            ping = ""
-        elif self._ping_ms < 0:
-            ping = "   proxy: no answer"
-        else:
-            ping = f"   proxy {self._ping_ms} ms"
-        tail = f"{ping}   reset {resets}×"
         if state == "idle":
-            return f"idle (no voice call){tail}"
-        label = {"ok": "OK", "stalled": "STALLED", "recovering": "RECOVERING"}.get(state, state)
-        return f"{label}   ↑ {self._fmt_rate(up)} ↓ {self._fmt_rate(down)}{tail}"
+            return "\u25cf  Idle"
+        label = {"ok": "In call", "stalled": "Stalled", "recovering": "Recovering"}.get(state, state)
+        return f"\u25cf  {label}   \u2191 {self._fmt_speed(up)}   \u2193 {self._fmt_speed(down)}"
 
     def _refresh_voice_label(self):
         state = self._voice_last[0]
         pal = getattr(self, "_pal", {}) or {}
-        color = {"ok": "#2e9b4f", "stalled": "#d9534f", "recovering": "#e0a030"}.get(state, pal.get("muted", "#777777"))
+        color = {"ok": pal.get("ok", "#2e9b4f"), "stalled": pal.get("bad", "#d9534f"),
+                 "recovering": pal.get("warn", "#e0a030")}.get(state, pal.get("muted", "#777777"))
         try:
             self.lbl_voice.configure(text=self._voice_text(*self._voice_last), foreground=color)
         except tk.TclError:
             pass
+        self._update_proxy_tile()
+
+    def _grade_color(self, ms):
+        pal = self._pal
+        return {"good": pal["ok"], "fair": pal["warn"], "bad": pal["bad"]}[quality_grade(ms, 0, 0)]
+
+    def _update_proxy_tile(self):
+        tile = getattr(self, "_vtiles", {}).get("proxy")
+        if tile is None:
+            return
+        ms = self._ping_ms
+        if ms is None:
+            tile.set_value("\u2014")
+        elif ms < 0:
+            tile.set_value("no answer", self._pal["bad"])
+        else:
+            tile.set_value(f"{ms} ms", self._grade_color(ms))
 
     def _voice_call_active(self) -> bool:
         """A Discord voice UDP flow exists (or did a moment ago) - mid-call guard."""
         return self._voice_status.in_call()
+
+    @staticmethod
+    def _fmt_speed(bps: float) -> str:
+        if bps >= 1024 * 1024:
+            return f"{bps / (1024 * 1024):.1f} MB/s"
+        if bps >= 1024:
+            return f"{bps / 1024:.0f} kB/s"
+        return f"{int(bps)} B/s"
+
+    def _set_traffic(self, up: int, down: int):
+        now = time.time()
+        ref = getattr(self, "_rate_ref", None)
+        r_up = r_down = 0.0
+        if ref is not None and now - ref[0] > 0.05 and up >= ref[1] and down >= ref[2]:
+            r_up, r_down = (up - ref[1]) / (now - ref[0]), (down - ref[2]) / (now - ref[0])
+        self._rate_ref = (now, up, down)
+        self._traffic_vals = (up, down)
+        for tile, value, rate in zip(self._tiles, (up, down, up + down), (r_up, r_down, r_up + r_down)):
+            tile.set_value(fmt_bytes(value), None, self._fmt_speed(rate))
 
     @staticmethod
     def _traffic_text(up: int, down: int) -> str:
@@ -6229,7 +7147,7 @@ class DiscordProxyApp(tk.Tk):
             "Discord Proxy log",
             f"Exported: {now:%Y-%m-%d %H:%M:%S}",
             f"Proxy core: {self._active_core or self.core_var.get()}",
-            f"Traffic: {self.lbl_traffic.cget('text')}",
+            f"Traffic: {self._traffic_text(*self._traffic_vals)}",
             "(UUIDs, passwords, keys and pinned-cert hashes are masked automatically. The log may still "
             "contain your proxy server's address - remove it before sharing publicly.)",
             "-" * 60,
@@ -6289,7 +7207,7 @@ class DiscordProxyApp(tk.Tk):
                 elif kind == "exit":
                     self._on_singbox_exited(payload)
                 elif kind == "stats":
-                    self.lbl_traffic.configure(text=self._traffic_text(*payload))
+                    self._set_traffic(*payload)
                 elif kind == "voicestat":
                     self._voice_last = payload
                     self._refresh_voice_label()
@@ -6665,14 +7583,14 @@ class DiscordProxyApp(tk.Tk):
         frame = ttk.Frame(dlg, padding=18)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="What would you like to do?", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Checkbutton(frame, text="Remember my choice",
+        ToggleSwitch(frame, text="Remember my choice",
                         variable=remember).pack(anchor="w", pady=(0, 12))
         row = ttk.Frame(frame)
         row.pack(fill="x")
-        b1 = ttk.Button(row, text="Minimize to tray", command=lambda: choose("tray"))
+        b1 = DialogButton(row, text="Minimize to tray", command=lambda: choose("tray"), kind="accent")
         b1.pack(side="left")
-        ttk.Button(row, text="Exit completely", command=lambda: choose("exit")).pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Cancel", command=lambda: choose(None)).pack(side="right")
+        DialogButton(row, text="Exit completely", command=lambda: choose("exit")).pack(side="left", padx=(8, 0))
+        DialogButton(row, text="Cancel", command=lambda: choose(None)).pack(side="right")
         dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
         dlg.bind("<Escape>", lambda e: choose(None))
 
@@ -6801,6 +7719,11 @@ class DiscordProxyApp(tk.Tk):
             for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (19 on early Windows 10 builds)
                 if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), 4) == 0:
                     break
+            # Windows 11 only (silently ignored elsewhere): caption bar and caption text match the window
+            for attr, key in ((35, "bg"), (36, "fg")):   # DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR
+                h = self._pal.get(key, "#000000").lstrip("#")
+                ref = ctypes.c_int(int(h[4:6] + h[2:4] + h[0:2], 16))   # COLORREF is 0x00BBGGRR
+                dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(ref), 4)
         except Exception:
             pass
 
@@ -6808,48 +7731,98 @@ class DiscordProxyApp(tk.Tk):
         win.configure(bg=self._pal["bg"])
         self._titlebar_dark(win)
 
+    def _build_styles(self, st, pal):
+        """One flat, Discord-like look for both palettes (clam is the ttk theme that honours colours)."""
+        st.theme_use("clam")
+        bg, card, fg, muted = pal["bg"], pal["card"], pal["fg"], pal["muted"]
+        field, field_fg, border = pal["field"], pal["field_fg"], pal["border"]
+        btn, hover, accent = pal["btn"], pal["btn_hover"], pal["accent"]
+        st.configure(".", background=bg, foreground=fg, fieldbackground=field, bordercolor=border,
+                     troughcolor=card, lightcolor=bg, darkcolor=bg, focuscolor=bg, insertcolor=fg)
+        st.configure("TFrame", background=bg)
+        st.configure("Card.TFrame", background=card)
+        st.configure("TLabel", background=bg, foreground=fg)
+        st.configure("Card.TLabel", background=card, foreground=fg)
+        st.configure("Title.TLabel", background=bg, foreground=fg, font=("Segoe UI", 17, "bold"))
+        st.configure("Heading.TLabel", background=card, foreground=muted, font=("Segoe UI", 8, "bold"))
+        st.configure("TLabelframe", background=bg, bordercolor=border)
+        st.configure("TLabelframe.Label", background=bg, foreground=fg)
+
+        def button(name, base, over, text, padding=(10, 6)):
+            st.configure(name, background=base, foreground=text, bordercolor=base, lightcolor=base,
+                         darkcolor=base, focuscolor=base, relief="flat", borderwidth=1, padding=padding)
+            states = [("disabled", card), ("pressed", over), ("active", over)]
+            st.map(name, background=states, bordercolor=states, lightcolor=states, darkcolor=states,
+                   foreground=[("disabled", muted)])
+
+        button("TButton", btn, hover, fg)
+        button("Small.TButton", btn, hover, fg, padding=(8, 4))
+        button("Accent.TButton", accent, pal["accent_hover"], pal["accent_fg"])
+        button("Go.TButton", pal["go"], pal["go_hover"], "#ffffff")
+        button("Stop.TButton", pal["stop"], pal["stop_hover"], "#ffffff")
+
+        for name in ("TEntry", "TSpinbox"):
+            st.configure(name, fieldbackground=field, foreground=field_fg, insertcolor=field_fg,
+                         bordercolor=border, lightcolor=field, darkcolor=field, padding=4)
+            st.map(name, bordercolor=[("focus", accent)], lightcolor=[("focus", accent)],
+                   darkcolor=[("focus", accent)])
+        st.configure("TSpinbox", arrowcolor=fg, background=btn)
+        st.configure("TCombobox", fieldbackground=field, background=btn, foreground=field_fg, arrowcolor=fg,
+                     bordercolor=border, lightcolor=field, darkcolor=field, padding=4)
+        st.map("TCombobox", fieldbackground=[("readonly", field)], foreground=[("readonly", field_fg)],
+               selectbackground=[("readonly", field)], selectforeground=[("readonly", field_fg)],
+               bordercolor=[("focus", accent)])
+
+        for name in ("TCheckbutton", "TRadiobutton", "Card.TCheckbutton"):
+            surface = card if name.startswith("Card.") else bg
+            st.configure(name, background=surface, foreground=fg, indicatorbackground=field,
+                         indicatorforeground=pal["accent_fg"], upperbordercolor=border,
+                         lowerbordercolor=border, focuscolor=surface, padding=3)
+            st.map(name, background=[("active", surface)], foreground=[("disabled", muted)],
+                   indicatorbackground=[("disabled", card), ("selected", accent), ("pressed", hover)])
+
+        st.configure("Treeview", background=field, fieldbackground=field, foreground=field_fg,
+                     bordercolor=field, lightcolor=field, darkcolor=field, rowheight=30, borderwidth=0)
+        st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", field_fg)])
+        st.configure("Treeview.Heading", background=field, foreground=muted, bordercolor=field,
+                     lightcolor=field, darkcolor=field, relief="flat", padding=(6, 5), font=("Segoe UI", 8, "bold"))
+        st.map("Treeview.Heading", background=[("active", hover)], foreground=[("active", fg)])
+
+        st.configure("TNotebook", background=bg, bordercolor=bg, lightcolor=bg, darkcolor=bg, borderwidth=0)
+        st.configure("TNotebook.Tab", background=field, foreground=muted, padding=(14, 6), borderwidth=0,
+                     bordercolor=field, lightcolor=field, darkcolor=field)
+        sel_tab = [("selected", bg), ("active", hover)]
+        st.map("TNotebook.Tab", background=sel_tab, lightcolor=sel_tab, darkcolor=sel_tab, bordercolor=sel_tab,
+               foreground=[("selected", fg), ("active", fg)])
+
+        st.configure("TScrollbar", background=btn, troughcolor=field, bordercolor=field, lightcolor=btn,
+                     darkcolor=btn, arrowcolor=muted, relief="flat", arrowsize=12)
+        st.map("TScrollbar", background=[("active", hover), ("pressed", hover)],
+               lightcolor=[("active", hover), ("pressed", hover)], darkcolor=[("active", hover), ("pressed", hover)])
+        st.configure("Horizontal.TProgressbar", background=accent, troughcolor=field, bordercolor=field,
+                     lightcolor=accent, darkcolor=accent)
+
+    def _update_pill(self):
+        """Connect button, state word and hint follow the proxy state."""
+        pal = self._pal
+        mode = {"running": "on", "starting": "connecting", "retrying": "connecting"}.get(self._state, "off")
+        text = {"running": "Connected", "starting": "Connecting...",
+                "retrying": "Reconnecting..."}.get(self._state, "Disconnected")
+        color = {"on": pal["ok"], "connecting": pal["warn"], "off": pal["muted"]}[mode]
+        try:
+            self.power_btn.set_mode(mode)
+            self.lbl_state.configure(text=text, fg=color)
+            self.lbl_hint.configure(text="Click to disconnect" if mode != "off" else "Click to connect")
+        except (AttributeError, tk.TclError):
+            pass
+
     def _apply_theme(self):
-        mode = self._settings.get("theme", "auto")
+        mode = self._settings.get("theme", "dark")
         dark = windows_prefers_dark() if mode == "auto" else mode == "dark"
         self._is_dark = dark
         st = ttk.Style(self)
-        if not self._default_ttk_theme:
-            self._default_ttk_theme = st.theme_use()
-        if dark:
-            pal = dict(DARK_PALETTE)
-            bg, fg, field = pal["bg"], pal["fg"], pal["field"]
-            btn, hover, border, muted = pal["btn"], pal["btn_hover"], pal["border"], pal["muted"]
-            st.theme_use("clam")
-            st.configure(".", background=bg, foreground=fg, fieldbackground=field, bordercolor=border,
-                         troughcolor=bg, lightcolor=bg, darkcolor=bg, focuscolor=bg, insertcolor=fg)
-            st.configure("TFrame", background=bg)
-            st.configure("TLabel", background=bg, foreground=fg)
-            st.configure("TLabelframe", background=bg, bordercolor=border)
-            st.configure("TLabelframe.Label", background=bg, foreground=fg)
-            st.configure("TButton", background=btn, foreground=fg, bordercolor=border, padding=(10, 4))
-            st.map("TButton", background=[("disabled", bg), ("pressed", hover), ("active", hover)],
-                   foreground=[("disabled", muted)])
-            st.configure("TCombobox", fieldbackground=field, background=btn, foreground=fg,
-                         arrowcolor=fg, bordercolor=border)
-            st.map("TCombobox", fieldbackground=[("readonly", field)], foreground=[("readonly", fg)],
-                   selectbackground=[("readonly", field)], selectforeground=[("readonly", fg)])
-            for name in ("TCheckbutton", "TRadiobutton"):
-                st.configure(name, background=bg, foreground=fg)
-                st.map(name, background=[("active", bg)], foreground=[("disabled", muted)])
-            st.configure("Treeview", background=field, fieldbackground=field, foreground=pal["field_fg"],
-                         bordercolor=border)
-            st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["field_fg"])])
-            st.configure("Treeview.Heading", background=btn, foreground=fg, bordercolor=border)
-            st.configure("TNotebook", background=bg, bordercolor=border)
-            st.configure("TNotebook.Tab", background=btn, foreground=fg, padding=(12, 4))
-            st.map("TNotebook.Tab", background=[("selected", bg), ("active", hover)])
-            st.configure("TSpinbox", fieldbackground=field, foreground=fg, arrowcolor=fg, bordercolor=border)
-            st.configure("TEntry", fieldbackground=field, foreground=fg, insertcolor=fg, bordercolor=border)
-            st.configure("TScrollbar", background=btn, troughcolor=bg, arrowcolor=fg, bordercolor=border)
-            st.configure("Horizontal.TProgressbar", background=pal["ok"], troughcolor=field, bordercolor=border)
-        else:
-            pal = dict(LIGHT_PALETTE, bg=self._default_bg)
-            st.theme_use(self._default_ttk_theme)
+        pal = dict(DARK_PALETTE if dark else LIGHT_PALETTE)
+        self._build_styles(st, pal)
         self._pal = pal
         self.option_add("*TCombobox*Listbox.background", pal["field"])
         self.option_add("*TCombobox*Listbox.foreground", pal["field_fg"])
@@ -6860,8 +7833,21 @@ class DiscordProxyApp(tk.Tk):
                                  selectbackground=pal["sel"], selectforeground=pal["field_fg"])
         self.log_text.configure(bg=pal["field"], fg=pal["field_fg"], insertbackground=pal["field_fg"],
                                 selectbackground=pal["sel"], selectforeground=pal["field_fg"])
-        self.hist_canvas.configure(bg=pal["field"], highlightbackground=pal.get("border", "#bdbdbd"),
-                                   highlightcolor=pal.get("border", "#bdbdbd"))
+        self.hist_canvas.configure(bg=pal["field"], highlightbackground=pal["field"],
+                                   highlightcolor=pal["field"])
+        try:
+            tree = getattr(self, "_links_tree", None)
+            if tree is not None:
+                tree.tag_configure("bad", foreground=pal["bad"])
+                tree.tag_configure("best", foreground=pal["ok"])
+            self.log_text.tag_configure("err", foreground=pal["bad"])
+            self.log_text.tag_configure("warn", foreground=pal["warn"])
+        except tk.TclError:
+            pass
+        self._update_pill()
+        RoundButton.retheme(pal)
+        self._backdrop = self._backdrop_card = None          # flat Discord colours, no background image
+        self._paint_backdrop()
         for menu in list(self._themed_menus):
             try:
                 menu.configure(bg=pal["field"], fg=pal["field_fg"], activebackground=pal["sel"],
@@ -7025,7 +8011,7 @@ class DiscordProxyApp(tk.Tk):
 
             for frac, label in ((0.0, "0"), (0.5, str(top // 2)), (1.0, str(top))):
                 y = T + ph - frac * ph
-                cv.create_line(L, y, W - R, y, fill=pal.get("border", "#d0d0d0"))
+                cv.create_line(L, y, W - R, y, fill=_mix(pal["field"], pal["muted"], 0.22))
                 cv.create_text(L - 4, y, text=label, anchor="e", fill=muted, font=("Segoe UI", 7))
             for frac, label in ((0.0, "-60 min"), (0.5, "-30"), (1.0, "now")):
                 anchor = "w" if frac == 0.0 else ("e" if frac == 1.0 else "center")
@@ -7049,15 +8035,26 @@ class DiscordProxyApp(tk.Tk):
                 x0 = L + i * bw
                 top_y = (T if not ok_vals[i] else Y(max(ok_vals[i]) if bad[i] else sum(ok_vals[i]) / len(ok_vals[i])))
                 top_y = min(top_y, T + ph - 2)
+                level = max(ok_vals[i]) if ok_vals[i] else 0
                 cv.create_rectangle(x0, top_y, x0 + max(1.0, bw - 1), T + ph, outline="",
-                                    fill="#d9534f" if bad[i] else pal.get("ok", "#2e9b4f"))
+                                    fill=pal["bad"] if bad[i] else self._grade_color(sum(ok_vals[i]) / len(ok_vals[i]))
+                                    if level else pal["bad"])
             avg, mx, drops, total = self._history.stats(now)
-            if avg is not None:
-                self.lbl_hist.configure(text=f"avg {avg:.0f} ms \u00b7 max {mx} ms \u00b7 lossy {drops}")
-            else:
-                self.lbl_hist.configure(text="No voice call yet")
+            self._set_hist_stats(avg, mx, drops)
         except tk.TclError:
             pass
+
+    def _set_hist_stats(self, avg, mx, drops):
+        tiles = getattr(self, "_hist_tiles", None)
+        if not tiles:
+            return
+        if avg is None:
+            for tile in tiles.values():
+                tile.set_value("\u2014")
+            return
+        tiles["avg"].set_value(f"{avg:.0f} ms", self._grade_color(avg))
+        tiles["max"].set_value(f"{mx} ms", self._grade_color(mx))
+        tiles["lossy"].set_value(str(drops), self._pal["bad"] if drops else self._pal["ok"])
 
     # =====================================================================
     # Voice quality readout (ping / loss / jitter)
@@ -7077,31 +8074,33 @@ class DiscordProxyApp(tk.Tk):
 
     def _refresh_voiceq(self):
         pal = getattr(self, "_pal", {}) or {}
-        muted = pal.get("muted", "#777777")
-        colors = {"good": "#2e9b4f", "fair": "#e0a030", "bad": "#d9534f"}
+        colors = {"good": pal.get("ok", "#2e9b4f"), "fair": pal.get("warn", "#e0a030"),
+                  "bad": pal.get("bad", "#d9534f")}
         q = self._voiceq
         in_call = self._voice_last[0] != "idle"
         flow = getattr(self._voice_status, "flow", "") or ""
-        color = muted
+        ping_t, loss_t, ping_c, loss_c = "\u2014", "\u2014", None, None
         if self._voice_probe is None:
-            text = "quality: off" if not self._settings.get("voice_probe", True) else "quality: not running"
-            second = " "
+            msg = ("Quality measurement is off" if not self._settings.get("voice_probe", True)
+                   else "Quality measurement is not running")
         elif not in_call or q is None:
-            text, second = "quality: no active voice call", " "
+            msg = "No active voice call"
         elif q.get("dead"):
-            text = "quality: no UDP answer through the proxy"
-            second, color = " ", colors["bad"]
+            msg, ping_t, ping_c = "No UDP answer through the proxy", "no answer", colors["bad"]
         elif q["samples"] < VoiceQualityProbe.MIN_SAMPLES or q.get("ping") is None:
-            text, second = "quality: measuring...", (f"voice server {flow}" if flow else " ")
+            msg = "Measuring..." + (f"   voice server {flow}" if flow else "")
         else:
-            grade = quality_grade(q["ping"], q["loss"], q["jitter"])
-            color = colors[grade]
-            jit = q["jitter"] if q["jitter"] is not None else 0.0
-            text = f"ping {q['ping']:.0f} ms   loss {q['loss']:.1f}%   jitter {jit:.1f} ms"
-            second = f"voice server {flow}" if flow else " "
+            ping_c = colors[quality_grade(q["ping"], q["loss"], q["jitter"])]
+            loss = q["loss"] or 0.0
+            loss_c = colors["bad"] if loss >= 5 else colors["fair"] if loss >= 1 else colors["good"]
+            ping_t, loss_t = f"{q['ping']:.0f} ms", f"{loss:.1f}%"
+            msg = f"Voice server {flow}" if flow else ""
         try:
-            self.lbl_voiceq.configure(text=text + "\n" + second, foreground=color)
-        except tk.TclError:
+            vt = getattr(self, "_vtiles", {})
+            vt["ping"].set_value(ping_t, ping_c)
+            vt["loss"].set_value(loss_t, loss_c)
+            self.lbl_voiceq.configure(text=msg)
+        except (tk.TclError, KeyError):
             pass
 
     # =====================================================================
@@ -7111,7 +8110,7 @@ class DiscordProxyApp(tk.Tk):
     def _apply_log_panel_visibility(self):
         try:
             if self._settings.get("show_log_panel", False):
-                self._log_outer.pack(fill="both", expand=True)
+                self._log_outer.pack(fill="both", expand=True, padx=(8, 16), pady=(0, 16))
                 self._log_refilter()
             else:
                 self._log_outer.pack_forget()
@@ -7617,12 +8616,12 @@ class DiscordProxyApp(tk.Tk):
                 w.destroy()
             if self._update_results:
                 if not self.btn_update.winfo_ismapped():
-                    self.btn_update.pack(side="left", padx=(8, 0), after=self.btn_elevate)
+                    self.btn_update.grid(row=0, column=0, sticky="ew", pady=(8, 0))
             elif self.btn_update.winfo_ismapped():
-                self.btn_update.pack_forget()
+                self.btn_update.grid_remove()
             for r in self._update_results:
                 text = f"\u25b2 {r['name']} {_fmt_ver(r['installed'])} \u2192 {_fmt_ver(r['latest'])} available"
-                lbl = ttk.Label(self.update_box, text=text, wraplength=WIN_WIDTH - 70, cursor="hand2",
+                lbl = self._tlabel(self.update_box, None, text=text, wraplength=WIN_WIDTH - 70, cursor="hand2",
                                 foreground=self._pal["warn"], font=("Segoe UI", 9, "underline"))
                 lbl.pack(anchor="w", pady=(2, 0))
                 lbl.bind("<Button-1>", lambda _e, u=r["url"]: webbrowser.open(u))
@@ -7686,7 +8685,7 @@ class DiscordProxyApp(tk.Tk):
             info = COMPONENTS[comp]
             var = tk.BooleanVar(value=(comp in preselect) if preselect else True)
             vars_[comp] = var
-            ttk.Checkbutton(f, variable=var, text=f"{info['file']}  ({'required' if info['required'] else 'optional'})"
+            ToggleSwitch(f, variable=var, text=f"{info['file']}  ({'required' if info['required'] else 'optional'})"
                             ).pack(anchor="w")
             src = ttk.Label(f, text=info["source"], font=("Segoe UI", 8), wraplength=430, justify="left")
             src.configure(foreground=self._pal["muted"])
@@ -7699,8 +8698,9 @@ class DiscordProxyApp(tk.Tk):
         result = {"go": False}
         row = ttk.Frame(f)
         row.pack(fill="x")
-        ttk.Button(row, text="Download", command=lambda: (result.update(go=True), dlg.destroy())).pack(side="left")
-        ttk.Button(row, text="Not now", command=dlg.destroy).pack(side="left", padx=(8, 0))
+        DialogButton(row, text="Download", command=lambda: (result.update(go=True), dlg.destroy()),
+                     kind="accent").pack(side="left")
+        DialogButton(row, text="Not now", command=dlg.destroy).pack(side="left", padx=(8, 0))
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.update_idletasks()
@@ -7734,7 +8734,7 @@ class DiscordProxyApp(tk.Tk):
         self._dl_label.pack(anchor="w")
         self._dl_bar = ttk.Progressbar(f, length=420, maximum=100, mode="determinate")
         self._dl_bar.pack(pady=(8, 10))
-        ttk.Button(f, text="Cancel", command=self._dl_cancel.set).pack(anchor="e")
+        DialogButton(f, text="Cancel", command=self._dl_cancel.set).pack(anchor="e")
         win.protocol("WM_DELETE_WINDOW", self._dl_cancel.set)
         win.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
@@ -7867,7 +8867,7 @@ class DiscordProxyApp(tk.Tk):
         # ------------------------------------------------------------ General
         t = tab_general
         heading(t, "Appearance", first=True)
-        theme_var = tk.StringVar(value=self._settings.get("theme", "auto"))
+        theme_var = tk.StringVar(value=self._settings.get("theme", "dark"))
         row = ttk.Frame(t)
         row.pack(anchor="w")
         for text, val in (("Match Windows", "auto"), ("Light", "light"), ("Dark", "dark")):
@@ -7877,7 +8877,7 @@ class DiscordProxyApp(tk.Tk):
 
         heading(t, "Notifications")
         notif_var = tk.BooleanVar(value=bool(self._settings.get("notifications", True)))
-        ttk.Checkbutton(t, text="Show Windows notifications", variable=notif_var,
+        ToggleSwitch(t, text="Show Windows notifications", variable=notif_var,
                         command=lambda: self._set_setting("notifications", notif_var.get())).pack(anchor="w")
 
         heading(t, "Smart auto-start")
@@ -7888,7 +8888,7 @@ class DiscordProxyApp(tk.Tk):
             self._auto_suppressed = False
             self._discord_gone_since = None
 
-        ttk.Checkbutton(t, text="Start/stop with Discord", variable=auto_var, command=on_auto).pack(anchor="w")
+        ToggleSwitch(t, text="Start/stop with Discord", variable=auto_var, command=on_auto).pack(anchor="w")
 
         heading(t, "Start with Windows")
         as_var = tk.BooleanVar(value=autostart_exists())
@@ -7907,7 +8907,7 @@ class DiscordProxyApp(tk.Tk):
             except ValueError:
                 return 30
 
-        cb_delay = ttk.Checkbutton(t, text="Wait before starting after I sign in", variable=ad_var)
+        cb_delay = ToggleSwitch(t, text="Wait before starting after I sign in", variable=ad_var)
         drow = ttk.Frame(t)
         spin = ttk.Spinbox(drow, from_=5, to=600, increment=5, width=5, textvariable=sec_var)
         ttk.Label(drow, text="seconds").pack(side="right", padx=(6, 0))
@@ -7953,7 +8953,7 @@ class DiscordProxyApp(tk.Tk):
             if ad_var.get():
                 reregister()
 
-        ttk.Checkbutton(t, text="Launch Discord Proxy in the tray when I sign in", variable=as_var,
+        ToggleSwitch(t, text="Launch Discord Proxy in the tray when I sign in", variable=as_var,
                         command=on_autostart).pack(anchor="w")
         cb_delay.configure(command=on_delay_toggle)
         cb_delay.pack(anchor="w", padx=(22, 0))
@@ -7972,6 +8972,12 @@ class DiscordProxyApp(tk.Tk):
                           ("Exit completely", "exit")):
             ttk.Radiobutton(t, text=text, value=val, variable=close_var,
                             command=lambda: self._set_setting("close_action", close_var.get())).pack(anchor="w")
+
+        heading(t, "Administrator")
+        admin_btn = DialogButton(t, text="Restart as Administrator", command=self._restart_elevated)
+        admin_btn.pack(anchor="w")
+        if is_admin():
+            admin_btn.state(["disabled"])
 
         # ------------------------------------------------------------ Network
         t = tab_network
@@ -7996,7 +9002,7 @@ class DiscordProxyApp(tk.Tk):
             ttk.Radiobutton(srow, text=text, value=val, variable=strict_var,
                             command=lambda: (self._set_setting("strict_route", strict_var.get()),
                                              self._capture_changed())).pack(side="left", padx=(0, 10))
-        ttk.Button(srow, text="Edit extra ranges...", command=self._open_ranges_file).pack(side="left", padx=(10, 0))
+        DialogButton(srow, text="Edit extra ranges...", command=self._open_ranges_file).pack(side="left", padx=(10, 0))
 
         trow = ttk.Frame(t)
         trow.pack(anchor="w", pady=(8, 0))
@@ -8023,9 +9029,9 @@ class DiscordProxyApp(tk.Tk):
             if not ks_var.get():
                 self._ks_release("turned off in Settings", force=True)
 
-        ttk.Checkbutton(t, text="Block Discord completely if the proxy fails", variable=ks_var,
+        ToggleSwitch(t, text="Block Discord completely if the proxy fails", variable=ks_var,
                         command=on_ks).pack(anchor="w")
-        ttk.Button(t, text="Unblock Discord now",
+        DialogButton(t, text="Unblock Discord now",
                    command=lambda: self._ks_release("unblocked by you", force=True)).pack(anchor="w", pady=(6, 0))
         note(t, "Active only after Discord's voice range is learned (or when 'Everything' is chosen) - never during "
                 "the learning run. If the proxy dies or is being restarted, a Windows Firewall rule stops Discord from "
@@ -8034,7 +9040,7 @@ class DiscordProxyApp(tk.Tk):
 
         heading(t, "Servers (right-hand list)")
         fo_var = tk.BooleanVar(value=bool(self._settings.get("failover", True)))
-        ttk.Checkbutton(t, text="Switch to the next saved link when the active one stops answering",
+        ToggleSwitch(t, text="Switch to the next saved link when the active one stops answering",
                         variable=fo_var, command=lambda: self._set_setting("failover", fo_var.get())).pack(anchor="w")
         note(t, "Failover needs at least two saved links. It switches after the proxy server has not answered "
                 f"for about {FAILOVER_FAILS} health checks in a row.")
@@ -8047,7 +9053,7 @@ class DiscordProxyApp(tk.Tk):
             if self._want_running:
                 self.status_bar.configure(text="Status: applies on next Start")
 
-        ttk.Checkbutton(t, text="Measure ping, packet loss and jitter during voice calls", variable=vp_var,
+        ToggleSwitch(t, text="Measure ping and packet loss during voice calls", variable=vp_var,
                         command=on_probe).pack(anchor="w")
         note(t, "While you are in a voice call, 4 tiny UDP test packets per second (about 35 bytes each) go through "
                 "the same proxy as your call; the ones that get no answer are counted as loss. It measures the "
@@ -8057,23 +9063,24 @@ class DiscordProxyApp(tk.Tk):
         t = tab_tools
         heading(t, "Live log", first=True)
         lp_var = tk.BooleanVar(value=bool(self._settings.get("show_log_panel", False)))
-        ttk.Checkbutton(t, text="Show a live log panel in the main window", variable=lp_var,
+        ToggleSwitch(t, text="Show a live log panel in the main window", variable=lp_var,
                         command=lambda: (self._set_setting("show_log_panel", lp_var.get()),
                                          self._apply_log_panel_visibility())).pack(anchor="w")
+        DialogButton(t, text="Export log (.txt)", command=self.export_log).pack(anchor="w", pady=(6, 0))
         note(t, "A collapsible log with search plus 'Errors only' and 'Discord only' filters. Off by default - "
                 "Export Log (.txt) always works.")
 
         heading(t, "Updates")
         up_var = tk.BooleanVar(value=bool(self._settings.get("check_updates", True)))
-        ttk.Checkbutton(t, text="Warn me when sing-box or Xray-core is outdated", variable=up_var,
+        ToggleSwitch(t, text="Warn me when sing-box or Xray-core is outdated", variable=up_var,
                         command=lambda: self._set_setting("check_updates", up_var.get())).pack(anchor="w")
-        ttk.Button(t, text="Check now", command=lambda: self._start_update_check(manual=True)
+        DialogButton(t, text="Check now", command=lambda: self._start_update_check(manual=True)
                    ).pack(anchor="w", pady=(6, 0))
         note(t, "Reads the newest release number from github.com (SagerNet/sing-box, XTLS/Xray-core) about every "
                 "12 hours. Nothing is downloaded or changed.")
 
         heading(t, "Missing programs")
-        ttk.Button(t, text="Download missing files...", command=lambda: self._offer_download()).pack(anchor="w")
+        DialogButton(t, text="Download missing files...", command=lambda: self._offer_download()).pack(anchor="w")
         note(t, f"sing-box.exe, wintun.dll and xray.exe from their official sources, for your Windows "
                 f"({_ARCH_LABEL.get(native_arch(), native_arch())}). Always asks first.")
 
@@ -8088,9 +9095,9 @@ class DiscordProxyApp(tk.Tk):
 
         bottom = ttk.Frame(outer)
         bottom.pack(fill="x", pady=(14, 0))
-        ttk.Button(bottom, text="Reset all settings...",
-                   command=lambda: self._reset_all(dlg, close_dlg)).pack(side="left")
-        ttk.Button(bottom, text="Close", command=close_dlg).pack(side="right")
+        DialogButton(bottom, text="Reset all settings...",
+                   command=lambda: self._reset_all(dlg, close_dlg), kind="stop").pack(side="left")
+        DialogButton(bottom, text="Close", command=close_dlg, kind="accent").pack(side="right")
         dlg.protocol("WM_DELETE_WINDOW", close_dlg)
         dlg.bind("<Escape>", lambda e: close_dlg())
 
