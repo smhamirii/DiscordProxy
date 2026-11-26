@@ -3448,6 +3448,96 @@ class StatTile(tk.Canvas):
             pass
 
 
+class StatusChip(tk.Canvas):
+    """Rounded status tile: coloured dot, small caption, status word. Clickable (cursor/bind) when it offers a download."""
+    def __init__(self, master, caption, height=44):
+        tk.Canvas.__init__(self, master, width=10, height=height, highlightthickness=0, bd=0)
+        self._cap, self._val, self._color = caption, "\u2026", None
+        self._surface = "card"
+        self._img = self._dot = None
+        tk.Canvas.configure(self, bg=_BTN_PAL["card"])
+        self.bind("<Configure>", lambda e: self._redraw())
+        RoundButton._all.add(self)
+
+    def set_state(self, text, color):
+        self._val, self._color = text, color
+        self._redraw()
+
+    def set_backdrop(self, img):
+        pass
+
+    def _redraw(self):
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 24 or h < 24:
+                return
+            p = _BTN_PAL
+            col = self._color or p["muted"]
+            self.delete("all")
+            self._img = _round_img(w, h, 10, p["field"], p["field"])
+            self.create_image(0, 0, anchor="nw", image=self._img)
+            self._dot = _round_img(10, 10, 5, col, col)
+            self.create_image(12, h // 2 - 5, anchor="nw", image=self._dot)
+            self.create_text(30, h * 0.31, text=self._cap, anchor="w", fill=p["muted"], font=("Segoe UI", 8, "bold"))
+            self.create_text(30, h * 0.69, text=self._val, anchor="w", fill=col, font=("Segoe UI", 10, "bold"))
+        except tk.TclError:
+            pass
+
+
+class StatusText(tk.Label):
+    """Status line: drops the 'Status: ' prefix (the card has its own caption) and tells the badge about changes."""
+    on_change = None
+
+    def configure(self, cnf=None, **kw):
+        opts = dict(cnf or {}, **kw)
+        t = opts.get("text")
+        if isinstance(t, str) and t.startswith("Status:"):
+            t = t[len("Status:"):].strip()
+            opts["text"] = t[:1].upper() + t[1:]
+        res = tk.Label.configure(self, **opts) if opts else tk.Label.configure(self)
+        if "text" in opts and self.on_change:
+            self.on_change()
+        return res
+
+    config = configure
+
+
+class StatusBadge(tk.Canvas):
+    """Rounded square with a symbol: grey (stopped), amber (working), green (running), red (problem)."""
+    SIZE = 44
+    GLYPH = {"off": "\u25a0", "connecting": "\u2026", "on": "\u2713", "error": "!"}
+
+    def __init__(self, master):
+        tk.Canvas.__init__(self, master, width=self.SIZE, height=self.SIZE, highlightthickness=0, bd=0)
+        self._mode = "off"
+        self._surface = "card"
+        self._img = None
+        tk.Canvas.configure(self, bg=_BTN_PAL["card"])
+        RoundButton._all.add(self)
+        self._redraw()
+
+    def set_mode(self, mode):
+        if mode != self._mode:
+            self._mode = mode
+            self._redraw()
+
+    def set_backdrop(self, img):
+        pass
+
+    def _redraw(self):
+        try:
+            p = _BTN_PAL
+            c = {"off": p["btn"], "connecting": p["warn"], "on": p["ok"], "error": p["bad"]}[self._mode]
+            self.delete("all")
+            self._img = _round_img(self.SIZE, self.SIZE, 13, _mix(c, "#ffffff", 0.10), _mix(c, "#000000", 0.08))
+            self.create_image(0, 0, anchor="nw", image=self._img)
+            size = 11 if self._mode == "off" else 17
+            self.create_text(self.SIZE // 2, self.SIZE // 2 + (0 if self._mode != "connecting" else -3),
+                             text=self.GLYPH[self._mode], fill="#ffffff", font=("Segoe UI", size, "bold"))
+        except tk.TclError:
+            pass
+
+
 def DialogButton(master, text="", command=None, kind="secondary"):
     """Rounded button for dialogs and the Settings window (sits on the plain window colour)."""
     return RoundButton(master, text=text, command=command, kind=kind, height=32, pad=16, surface="glass")
@@ -5457,10 +5547,8 @@ class DiscordProxyApp(tk.Tk):
         self._logo = _round_img(40, 40, 12, "#7983f5", "#d63c8c")
         hcv.create_image(0, 23, anchor="w", image=self._logo)
         hcv.create_text(20, 23, text="D", font=("Segoe UI", 16, "bold"), fill="#ffffff")
-        hcv.create_text(52, 14, text="Discord Proxy", anchor="w", font=("Segoe UI", 15, "bold"),
+        hcv.create_text(52, 23, text="Discord Proxy", anchor="w", font=("Segoe UI", 15, "bold"),
                         fill=pal["fg"], tags="title")
-        hcv.create_text(52, 33, text="Fast, private voice for Discord", anchor="w", font=("Segoe UI", 8),
-                        fill=pal["muted"], tags="subtitle")
         self._rbtn(header, "Settings", self._open_settings, height=30).place(relx=1.0, rely=0.5, anchor="e")
 
         # --- hero: one big connect button, state, core selector, traffic and voice
@@ -5473,9 +5561,7 @@ class DiscordProxyApp(tk.Tk):
         info = self._glass_frame(top_row)
         info.pack(side="left", fill="both", expand=True, padx=(14, 0))
         self.lbl_state = self._tlabel(info, None, text="Disconnected", font=("Segoe UI", 18, "bold"))
-        self.lbl_state.pack(anchor="w", pady=(14, 0))
-        self.lbl_hint = self._tlabel(info, "muted", text="Click to connect", font=("Segoe UI", 9))
-        self.lbl_hint.pack(anchor="w", pady=(0, 10))
+        self.lbl_state.pack(anchor="w", pady=(20, 14))
         core_row = self._glass_frame(info)
         core_row.pack(fill="x")
         self._tlabel(core_row, "muted", text="PROXY CORE", font=("Segoe UI", 8, "bold")).pack(anchor="w")
@@ -5526,7 +5612,7 @@ class DiscordProxyApp(tk.Tk):
             self._vtiles[key] = t
         self.lbl_voiceq = self._tlabel(stats, "muted", text="", font=("Segoe UI", 8), wraplength=wrap - 24,
                                        justify="left")
-        self.lbl_voiceq.pack(anchor="w", pady=(6, 0))
+        # (lbl_voiceq is kept for the code that sets it, but no longer shown)
 
         # --- quick actions: one grid, three equal columns, every button the same size ---
         ctl = card()
@@ -5551,19 +5637,16 @@ class DiscordProxyApp(tk.Tk):
         self._heading(status_box, "System")
         grid = self._glass_frame(status_box)
         grid.pack(fill="x")
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-
-        self.lbl_singbox = self._tlabel(grid, None, text="● sing-box.exe: checking...")
-        self.lbl_singbox.grid(row=0, column=0, sticky="w")
-        self.lbl_wintun = self._tlabel(grid, None, text="● wintun.dll: checking...")
-        self.lbl_wintun.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.lbl_admin = self._tlabel(grid, None, text="● Administrator: checking...")
-        self.lbl_admin.grid(row=0, column=1, sticky="w")
-        self.lbl_discord = self._tlabel(grid, None, text="● Discord: checking...")
-        self.lbl_discord.grid(row=1, column=1, sticky="w", pady=(4, 0))
-        self.lbl_xray = self._tlabel(grid, None, text="● xray-core: checking...")
-        self.lbl_xray.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        names = (("lbl_singbox", "SING-BOX"), ("lbl_wintun", "WINTUN"), ("lbl_xray", "XRAY-CORE"),
+                 ("lbl_admin", "ADMIN"), ("lbl_discord", "DISCORD"))
+        for i, (attr, cap) in enumerate(names):
+            r, c = divmod(i, 3)
+            grid.grid_columnconfigure(c, weight=1, uniform="chip")
+            chip = StatusChip(grid, cap)
+            chip.grid(row=r, column=c, sticky="ew", padx=(0 if c == 0 else 3, 0 if c == 2 else 3),
+                      pady=(0 if r == 0 else 6, 0))
+            self._glass_btns.append(chip)
+            setattr(self, attr, chip)
 
         btn_row = self._glass_frame(status_box)      # only holds the Update button, shown when an update exists
         btn_row.pack(fill="x")
@@ -5582,11 +5665,20 @@ class DiscordProxyApp(tk.Tk):
         # Fixed-height status area (3 lines) so a long status never changes the window size.
         status_area = self._card(root, padx=LP, pady=(0, 16))
         self._status_area = status_area._outer
-        status_area._outer.configure(height=76)
+        status_area._outer.configure(height=86)
         status_area._outer.pack_propagate(False)
-        self.status_bar = self._tlabel(status_area, "fg", text="Status: stopped", font=("Segoe UI", 9, "bold"),
-                                       wraplength=wrap, justify="left")
-        self.status_bar.pack(anchor="nw")
+        self.status_badge = StatusBadge(status_area)
+        self._glass_btns.append(self.status_badge)
+        self.status_badge.pack(side="left", anchor="n")
+        status_col = self._glass_frame(status_area)
+        status_col.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        self._tlabel(status_col, "muted", text="STATUS", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.status_bar = StatusText(status_col, text="Stopped", font=("Segoe UI", 9, "bold"),
+                                     bg=pal["bg"], fg=pal["fg"], bd=0, highlightthickness=0, padx=0, pady=0,
+                                     wraplength=wrap - 74, justify="left", anchor="w")
+        self._tints.append((self.status_bar, "fg"))
+        self.status_bar.on_change = self._update_status_badge
+        self.status_bar.pack(anchor="w", pady=(3, 0))
 
         self._build_side_panel(body)
         self.bind("<Map>", lambda e: self._schedule_paint() if e.widget is self else None, add="+")
@@ -5948,7 +6040,8 @@ class DiscordProxyApp(tk.Tk):
     def _set_download_link(self, label, comp, missing):
         """A missing file's row becomes a link: clicking it opens the download dialog, which asks first."""
         if missing:
-            label.configure(text=label.cget("text") + "  (download)", cursor="hand2", foreground=self._pal["warn"])
+            label.set_state("Download", self._pal["warn"])
+            label.configure(cursor="hand2")
             label.bind("<Button-1>", lambda e, c=comp: self._offer_download(preselect=[c]))
         else:
             label.configure(cursor="")
@@ -6104,10 +6197,9 @@ class DiscordProxyApp(tk.Tk):
         if not game:
             self._revert_pending = False
 
-    def _set_status(self, label: ttk.Label, name: str, ok: bool, detail: str):
-        dot = "●" if ok else "○"
-        label.configure(text=f"{dot} {name}: {detail}",
-                        foreground=(self._pal["ok"] if ok else self._pal["warn"]))
+    def _set_status(self, chip, name: str, ok: bool, detail: str):
+        text = detail.split(" (")[0]
+        chip.set_state(text[:1].upper() + text[1:], self._pal["ok"] if ok else self._pal["warn"])
 
     # ------------------------------------------------ watchdog / auto mode
 
@@ -7802,6 +7894,20 @@ class DiscordProxyApp(tk.Tk):
         st.configure("Horizontal.TProgressbar", background=accent, troughcolor=field, bordercolor=field,
                      lightcolor=accent, darkcolor=accent)
 
+    def _update_status_badge(self):
+        badge = getattr(self, "status_badge", None)
+        if badge is None:
+            return
+        text = (self.status_bar.cget("text") or "").lower()
+        if any(w in text for w in ("error", "failed", "missing", "invalid", "could not")):
+            mode = "error"
+        elif any(w in text for w in ("weak", "restart", "retry", "reconnect", "testing", "starting", "switching",
+                                      "busy", "cleaning", "closing", "shutting")):
+            mode = "connecting"
+        else:
+            mode = {"running": "on", "starting": "connecting", "retrying": "connecting"}.get(self._state, "off")
+        badge.set_mode(mode)
+
     def _update_pill(self):
         """Connect button, state word and hint follow the proxy state."""
         pal = self._pal
@@ -7812,7 +7918,7 @@ class DiscordProxyApp(tk.Tk):
         try:
             self.power_btn.set_mode(mode)
             self.lbl_state.configure(text=text, fg=color)
-            self.lbl_hint.configure(text="Click to disconnect" if mode != "off" else "Click to connect")
+            self._update_status_badge()
         except (AttributeError, tk.TclError):
             pass
 
